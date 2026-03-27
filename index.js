@@ -24,8 +24,8 @@ const SHOOTING_FRAME_COUNT = 8;
 const SCENE_MIN_FRAMES = 4;
 const SCENE_MAX_FRAMES = 10;
 
-/** When duration cannot be read (e.g. some .webm), use fixed seeks instead of failing */
-const FALLBACK_SHOOTING_SEEK_SEC = [0.5, 1.5, 2.5, 3.5, 4.5, 5.5, 6.5, 7.5];
+/** METHOD 3 — when duration cannot be determined (e.g. broken webm metadata) */
+const FALLBACK_SHOOTING_SEEK_SEC = [1, 2, 3, 4, 5, 6, 7, 8];
 
 function isSafeId(value) {
   return typeof value === "string" && /^[a-zA-Z0-9._-]+$/.test(value) && value.length <= 256;
@@ -46,16 +46,81 @@ function resolveStrategy(movementType) {
   return "squat";
 }
 
+/** Browser-compressed webm often needs PTS regeneration for reliable seeks */
+function isWebmPath(p) {
+  return typeof p === "string" && p.toLowerCase().endsWith(".webm");
+}
+
+/** @param {boolean} isWebm */
+function inputPrefixFlags(isWebm) {
+  return isWebm ? ["-fflags", "+genpts"] : [];
+}
+
 /**
- * Same idea as `ffmpeg -i file 2>&1` (probe metadata). Duration is on stderr.
- * @param {string} inputPath
- * @returns {Promise<number | null>} null if no Duration line matched
+ * METHOD 1 — Duration from ffmpeg -i stderr
+ * @param {string} combined
+ * @returns {number | null}
  */
-async function getVideoDurationSec(inputPath) {
+function parseDurationFromCombined(combined) {
+  const durationMatch = combined.match(/Duration:\s*(\d+):(\d+):(\d+\.?\d*)/);
+  if (!durationMatch) return null;
+  const hours = parseFloat(durationMatch[1]);
+  const minutes = parseFloat(durationMatch[2]);
+  const seconds = parseFloat(durationMatch[3]);
+  const durationSec = hours * 3600 + minutes * 60 + seconds;
+  return Number.isFinite(durationSec) ? durationSec : null;
+}
+
+/**
+ * METHOD 2 — decode to null; last frame= and fps= from stats
+ * @param {string} inputPath
+ * @param {boolean} isWebm
+ * @returns {Promise<number | null>}
+ */
+async function getDurationFromFrameCount(inputPath, isWebm) {
+  const pre = inputPrefixFlags(isWebm);
+  const nullSink = process.platform === "win32" ? "NUL" : "/dev/null";
+  const args = [...pre, "-i", inputPath, "-map", "0:v:0", "-c", "copy", "-f", "null", nullSink];
+  let combined = "";
+  try {
+    const r = await execFileAsync(FFMPEG, args, { maxBuffer: 50 * 1024 * 1024 });
+    const stderr = r.stderr != null ? Buffer.from(r.stderr).toString() : "";
+    const stdout = r.stdout != null ? Buffer.from(r.stdout).toString() : "";
+    combined = stderr + stdout;
+  } catch (err) {
+    const stderr = err.stderr != null ? Buffer.from(err.stderr).toString() : "";
+    const stdout = err.stdout != null ? Buffer.from(err.stdout).toString() : "";
+    combined = stderr + stdout;
+  }
+
+  let lastFrame = null;
+  let lastFps = null;
+  const lines = combined.split(/\r?\n/);
+  for (const line of lines) {
+    const fm = line.match(/frame=\s*(\d+)/);
+    if (fm) lastFrame = parseInt(fm[1], 10);
+    const fp = line.match(/fps=\s*([\d.]+)/);
+    if (fp) lastFps = parseFloat(fp[1]);
+  }
+
+  if (lastFrame == null || !Number.isFinite(lastFrame) || lastFrame < 0) return null;
+  if (lastFps == null || !Number.isFinite(lastFps) || lastFps <= 0) return null;
+  const durationSec = lastFrame / lastFps;
+  return Number.isFinite(durationSec) && durationSec > 0 ? durationSec : null;
+}
+
+/**
+ * @param {string} inputPath
+ * @param {boolean} isWebm
+ * @returns {Promise<number | null>}
+ */
+async function getVideoDurationSec(inputPath, isWebm) {
   let stderr = "";
   let stdout = "";
   try {
-    const r = await execFileAsync(FFMPEG, ["-i", inputPath], { maxBuffer: 10 * 1024 * 1024 });
+    const r = await execFileAsync(FFMPEG, [...inputPrefixFlags(isWebm), "-i", inputPath], {
+      maxBuffer: 10 * 1024 * 1024,
+    });
     stderr = r.stderr != null ? Buffer.from(r.stderr).toString() : "";
     stdout = r.stdout != null ? Buffer.from(r.stdout).toString() : "";
   } catch (err) {
@@ -66,13 +131,20 @@ async function getVideoDurationSec(inputPath) {
   console.log("[frames] ffmpeg stderr:", stderr.slice(0, 500));
 
   const combined = stderr + stdout;
-  const durationMatch = combined.match(/Duration:\s*(\d+):(\d+):(\d+\.?\d*)/);
-  if (!durationMatch) return null;
-  const hours = parseFloat(durationMatch[1]);
-  const minutes = parseFloat(durationMatch[2]);
-  const seconds = parseFloat(durationMatch[3]);
-  const durationSec = hours * 3600 + minutes * 60 + seconds;
-  return Number.isFinite(durationSec) ? durationSec : null;
+  const d1 = parseDurationFromCombined(combined);
+  if (d1 != null && d1 > 0) {
+    console.log("[frames] duration method:", "ffmpeg-i-duration", d1);
+    return d1;
+  }
+
+  const d2 = await getDurationFromFrameCount(inputPath, isWebm);
+  if (d2 != null && d2 > 0) {
+    console.log("[frames] duration method:", "ffmpeg-null-framecount", d2);
+    return d2;
+  }
+
+  console.log("[frames] duration method:", "failed", null);
+  return null;
 }
 
 /** @param {number} durationSec */
@@ -156,8 +228,9 @@ app.post("/extract-frames", async (req, res) => {
   }
 
   const strategy = resolveStrategy(movementType);
-
-  const inputPath = path.join("/tmp", `${analysisId}.mov`);
+  const isWebm = isWebmPath(normalizedPath);
+  const ext = path.extname(normalizedPath) || ".bin";
+  const inputPath = path.join("/tmp", `${analysisId}${ext}`);
 
   /** @type {string[]} */
   let framePaths = [];
@@ -218,6 +291,7 @@ app.post("/extract-frames", async (req, res) => {
         await execFileAsync(
           FFMPEG,
           [
+            ...inputPrefixFlags(isWebm),
             "-i",
             inputPath,
             "-vf",
@@ -244,9 +318,10 @@ app.post("/extract-frames", async (req, res) => {
       if (scenePaths.length >= SCENE_MIN_FRAMES) {
         framePaths = scenePaths;
       } else {
-        const durationSec = await getVideoDurationSec(inputPath);
+        const durationSec = await getVideoDurationSec(inputPath, isWebm);
         if (durationSec == null || !Number.isFinite(durationSec) || durationSec <= 0) {
           timesSec = [...FALLBACK_SHOOTING_SEEK_SEC];
+          console.log("[frames] duration method:", "fixed-fallback-shooting", timesSec.join(","));
         } else {
           timesSec = shootingFrameTimesSec(durationSec);
         }
@@ -257,6 +332,7 @@ app.post("/extract-frames", async (req, res) => {
           await execFileAsync(FFMPEG, [
             "-ss",
             String(timesSec[i]),
+            ...inputPrefixFlags(isWebm),
             "-i",
             inputPath,
             ...ffmpegBase,
@@ -268,7 +344,15 @@ app.post("/extract-frames", async (req, res) => {
       for (let i = 0; i < framePaths.length; i++) {
         const t = timesSec[i];
         const ss = `00:00:${String(t).padStart(2, "0")}`;
-        await execFileAsync(FFMPEG, ["-ss", ss, "-i", inputPath, ...ffmpegBase, framePaths[i]]);
+        await execFileAsync(FFMPEG, [
+          "-ss",
+          ss,
+          ...inputPrefixFlags(isWebm),
+          "-i",
+          inputPath,
+          ...ffmpegBase,
+          framePaths[i],
+        ]);
       }
     }
 

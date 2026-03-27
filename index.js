@@ -13,7 +13,8 @@ const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 const STORAGE_BUCKET = process.env.SUPABASE_STORAGE_BUCKET || "videos";
 
-const FRAME_SECONDS = [1, 2, 3];
+const SQUAT_FRAME_SECONDS = [1, 2, 3];
+const SHOOTING_FRAME_COUNT = 8;
 
 function isSafeId(value) {
   return typeof value === "string" && /^[a-zA-Z0-9._-]+$/.test(value) && value.length <= 256;
@@ -24,6 +25,46 @@ function authOk(req) {
   const h = req.headers.authorization;
   if (typeof h !== "string") return false;
   return h === SERVICE_SECRET || h === `Bearer ${SERVICE_SECRET}`;
+}
+
+/** @param {unknown} movementType */
+function resolveStrategy(movementType) {
+  if (movementType == null) return "squat";
+  const mt = String(movementType).toLowerCase().trim();
+  if (mt === "shooting" || mt === "basketball") return "shooting";
+  return "squat";
+}
+
+/**
+ * ffmpeg -i prints Duration to stderr and exits non-zero when no output is given.
+ * @param {string} inputPath
+ * @returns {Promise<number | null>}
+ */
+async function getVideoDurationSec(inputPath) {
+  let combined = "";
+  try {
+    await execFileAsync("ffmpeg", ["-i", inputPath], { maxBuffer: 10 * 1024 * 1024 });
+  } catch (err) {
+    const stderr = err.stderr != null ? Buffer.from(err.stderr).toString() : "";
+    const stdout = err.stdout != null ? Buffer.from(err.stdout).toString() : "";
+    combined = stderr + stdout;
+  }
+  const m = combined.match(/Duration:\s*(\d{1,2}):(\d{2}):(\d{2}\.\d+)/);
+  if (!m) return null;
+  const h = parseInt(m[1], 10);
+  const min = parseInt(m[2], 10);
+  const sec = parseFloat(m[3]);
+  return h * 3600 + min * 60 + sec;
+}
+
+/** @param {number} durationSec */
+function shootingFrameTimesSec(durationSec) {
+  const n = SHOOTING_FRAME_COUNT;
+  const times = [];
+  for (let i = 0; i < n; i++) {
+    times.push(((i + 0.5) / n) * durationSec);
+  }
+  return times;
 }
 
 const app = express();
@@ -42,7 +83,7 @@ app.post("/extract-frames", async (req, res) => {
     return res.status(500).json({ error: "Missing Supabase env vars" });
   }
 
-  const { analysisId, storagePath } = req.body ?? {};
+  const { analysisId, storagePath, movementType } = req.body ?? {};
 
   if (!isSafeId(analysisId) || typeof storagePath !== "string" || !storagePath.trim()) {
     return res.status(400).json({ error: "Invalid analysisId or storagePath" });
@@ -53,10 +94,26 @@ app.post("/extract-frames", async (req, res) => {
     return res.status(400).json({ error: "Invalid storagePath" });
   }
 
+  const strategy = resolveStrategy(movementType);
+
   const inputPath = path.join("/tmp", `${analysisId}.mov`);
-  const framePaths = FRAME_SECONDS.map(
-    (sec) => path.join("/tmp", `${analysisId}-frame-${sec}s.jpg`),
-  );
+
+  /** @type {string[]} */
+  let framePaths = [];
+  /** @type {number[]} */
+  let timesSec = [];
+
+  if (strategy === "squat") {
+    framePaths = SQUAT_FRAME_SECONDS.map((sec) =>
+      path.join("/tmp", `${analysisId}-frame-${sec}s.jpg`),
+    );
+    timesSec = [...SQUAT_FRAME_SECONDS];
+  } else {
+    framePaths = Array.from({ length: SHOOTING_FRAME_COUNT }, (_, i) =>
+      path.join("/tmp", `${analysisId}-shooting-${i}.jpg`),
+    );
+    timesSec = []; // filled after download + duration
+  }
 
   const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
@@ -86,25 +143,32 @@ app.post("/extract-frames", async (req, res) => {
     const buf = Buffer.from(await blob.arrayBuffer());
     await fs.writeFile(inputPath, buf);
 
-    for (let i = 0; i < FRAME_SECONDS.length; i++) {
-      const sec = FRAME_SECONDS[i];
-      const ss = `00:00:${String(sec).padStart(2, "0")}`;
-      const out = framePaths[i];
-      await execFileAsync("ffmpeg", [
-        "-ss",
-        ss,
-        "-i",
-        inputPath,
-        "-vframes",
-        "1",
-        "-vf",
-        "scale=800:-1",
-        "-pix_fmt",
-        "yuvj420p",
-        "-q:v",
-        "2",
-        out,
-      ]);
+    if (strategy === "shooting") {
+      const durationSec = await getVideoDurationSec(inputPath);
+      if (durationSec == null || !Number.isFinite(durationSec) || durationSec <= 0) {
+        return res.status(422).json({ error: "Could not read video duration" });
+      }
+      timesSec = shootingFrameTimesSec(durationSec);
+    }
+
+    const ffmpegBase = [
+      "-vframes",
+      "1",
+      "-vf",
+      "scale=800:-1",
+      "-pix_fmt",
+      "yuvj420p",
+      "-q:v",
+      "2",
+    ];
+
+    for (let i = 0; i < framePaths.length; i++) {
+      const t = timesSec[i];
+      const ss =
+        strategy === "squat"
+          ? `00:00:${String(t).padStart(2, "0")}`
+          : String(t);
+      await execFileAsync("ffmpeg", ["-ss", ss, "-i", inputPath, ...ffmpegBase, framePaths[i]]);
     }
 
     const frames = [];

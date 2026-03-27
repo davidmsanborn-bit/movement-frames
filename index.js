@@ -16,6 +16,9 @@ const STORAGE_BUCKET = process.env.SUPABASE_STORAGE_BUCKET || "videos";
 /** Default `ffmpeg` on Linux/Railway; set e.g. `/opt/homebrew/bin/ffmpeg` locally if needed */
 const FFMPEG = process.env.FFMPEG_PATH || "ffmpeg";
 
+/** Normalize high-fps / slo-mo (e.g. 120/240fps) to 30fps before scale so seeks and extracts behave consistently */
+const VF_EXTRACT = "fps=30,scale=800:-1";
+
 const SQUAT_FRAME_SECONDS = [1, 2, 3];
 const SHOOTING_FRAME_COUNT = 8;
 const SCENE_MIN_FRAMES = 4;
@@ -200,7 +203,7 @@ app.post("/extract-frames", async (req, res) => {
       "-vframes",
       "1",
       "-vf",
-      "scale=800:-1",
+      VF_EXTRACT,
       "-pix_fmt",
       "yuvj420p",
       "-q:v",
@@ -209,7 +212,7 @@ app.post("/extract-frames", async (req, res) => {
 
     if (strategy === "shooting") {
       const sceneOutPattern = path.join("/tmp", `${analysisId}-scene-%03d.jpg`);
-      const sceneVf = "select=gt(scene\\,0.15),scale=800:-1";
+      const sceneVf = "select=gt(scene\\,0.15),fps=30,scale=800:-1";
 
       try {
         await execFileAsync(

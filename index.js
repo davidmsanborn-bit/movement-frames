@@ -1,6 +1,7 @@
 const express = require("express");
 const { createClient } = require("@supabase/supabase-js");
 const fs = require("fs/promises");
+const fssync = require("fs");
 const path = require("path");
 const { execFile } = require("child_process");
 const { promisify } = require("util");
@@ -13,19 +14,18 @@ const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 const STORAGE_BUCKET = process.env.SUPABASE_STORAGE_BUCKET || "videos";
 
-/** Default `ffmpeg` on Linux/Railway; set e.g. `/opt/homebrew/bin/ffmpeg` locally if needed */
-const FFMPEG = process.env.FFMPEG_PATH || "ffmpeg";
+/** Default `/usr/bin/ffmpeg` on Linux/Railway; override with FFMPEG_PATH */
+const FFMPEG = process.env.FFMPEG_PATH || "/usr/bin/ffmpeg";
 
-/** Normalize high-fps / slo-mo (e.g. 120/240fps) to 30fps before scale so seeks and extracts behave consistently */
-const VF_EXTRACT = "fps=30,scale=800:-1";
-
-const SQUAT_FRAME_SECONDS = [1, 2, 3];
-const SHOOTING_FRAME_COUNT = 8;
 const SCENE_MIN_FRAMES = 4;
 const SCENE_MAX_FRAMES = 10;
+const EVEN_SPREAD_COUNT = 8;
 
-/** METHOD 3 — when duration cannot be determined (e.g. broken webm metadata) */
-const FALLBACK_SHOOTING_SEEK_SEC = [1, 2, 3, 4, 5, 6, 7, 8];
+const FIXED_TIMESTAMPS = {
+  shooting: [0.5, 1.5, 2.5, 3.5, 4.5, 5.5, 6.5, 7.5],
+  deadlift: [1, 2, 3, 4, 5, 6, 7, 8],
+  default: [1, 2, 3],
+};
 
 function isSafeId(value) {
   return typeof value === "string" && /^[a-zA-Z0-9._-]+$/.test(value) && value.length <= 256;
@@ -36,14 +36,6 @@ function authOk(req) {
   const h = req.headers.authorization;
   if (typeof h !== "string") return false;
   return h === SERVICE_SECRET || h === `Bearer ${SERVICE_SECRET}`;
-}
-
-/** @param {unknown} movementType */
-function resolveStrategy(movementType) {
-  if (movementType == null) return "squat";
-  const mt = String(movementType).toLowerCase().trim();
-  if (mt === "shooting" || mt === "basketball") return "shooting";
-  return "squat";
 }
 
 /** Browser-compressed webm often needs PTS regeneration for reliable seeks */
@@ -147,41 +139,196 @@ async function getVideoDurationSec(inputPath, isWebm) {
   return null;
 }
 
-/** @param {number} durationSec */
-function shootingFrameTimesSec(durationSec) {
-  const n = SHOOTING_FRAME_COUNT;
-  const times = [];
-  for (let i = 0; i < n; i++) {
-    times.push(((i + 0.5) / n) * durationSec);
+/** @param {string[]} paths @param {number} max */
+function subsampleEvenly(paths, max) {
+  if (paths.length <= max) return paths;
+  const n = paths.length;
+  const out = [];
+  for (let k = 0; k < max; k++) {
+    const idx = Math.round((k * (n - 1)) / (max - 1 || 1));
+    out.push(paths[idx]);
   }
-  return times;
+  return out;
 }
 
-/**
- * List /tmp/{analysisId}-scene-NNN.jpg from scene-detect pass, sorted by frame number.
- * @param {string} analysisId
- * @returns {Promise<string[]>}
- */
-async function listSceneFramePaths(analysisId) {
-  const dir = "/tmp";
-  const prefix = `${analysisId}-scene-`;
-  let entries;
+/** @param {string} sceneFramesDir */
+async function listSceneFrameJpegs(sceneFramesDir) {
+  let entries = [];
   try {
-    entries = await fs.readdir(dir);
+    entries = await fs.readdir(sceneFramesDir);
   } catch {
     return [];
   }
-  const paths = entries
-    .filter((f) => f.startsWith(prefix) && f.endsWith(".jpg"))
-    .map((f) => {
-      const m = f.match(/-scene-(\d+)\.jpg$/);
-      const n = m ? parseInt(m[1], 10) : NaN;
-      return { n, p: path.join(dir, f) };
+  return entries
+    .filter((f) => /^frame_\d+\.jpg$/i.test(f))
+    .sort((a, b) => {
+      const na = parseInt(String(a.match(/\d+/)?.[0] ?? "0"), 10);
+      const nb = parseInt(String(b.match(/\d+/)?.[0] ?? "0"), 10);
+      return na - nb;
     })
-    .filter((x) => Number.isFinite(x.n))
-    .sort((a, b) => a.n - b.n)
-    .map((x) => x.p);
+    .map((f) => path.join(sceneFramesDir, f));
+}
+
+async function unlinkMatching(sceneFramesDir, regex) {
+  let entries = [];
+  try {
+    entries = await fs.readdir(sceneFramesDir);
+  } catch {
+    return;
+  }
+  for (const f of entries) {
+    if (!regex.test(f)) continue;
+    try {
+      await fs.unlink(path.join(sceneFramesDir, f));
+    } catch {
+      /* ignore */
+    }
+  }
+}
+
+/**
+ * STEP 1 / 2 — scene detection into sceneFramesDir/frame_%03d.jpg
+ * @param {number} threshold e.g. 0.15 or 0.08
+ */
+async function runSceneDetection(inputPath, sceneFramesDir, threshold, isWebm) {
+  const outPattern = path.join(sceneFramesDir, "frame_%03d.jpg");
+  const vf = `select=gt(scene\\,${threshold}),scale=800:-1,fps=30`;
+  const args = ["-y", "-hide_banner", "-loglevel", "error"];
+  if (isWebm) args.push("-fflags", "+genpts");
+  args.push(
+    "-i",
+    inputPath,
+    "-vf",
+    vf,
+    "-vsync",
+    "vfr",
+    "-pix_fmt",
+    "yuvj420p",
+    "-q:v",
+    "2",
+    outPattern,
+  );
+  await execFileAsync(FFMPEG, args, { maxBuffer: 50 * 1024 * 1024 });
+}
+
+async function extractOneFrameAtTime(inputPath, outputJpg, timeSeconds, isWebm) {
+  const args = ["-y", "-hide_banner", "-loglevel", "error", "-ss", String(timeSeconds)];
+  if (isWebm) args.push("-fflags", "+genpts");
+  args.push(
+    "-i",
+    inputPath,
+    "-an",
+    "-vf",
+    "scale=800:-1,fps=30",
+    "-vframes",
+    "1",
+    "-pix_fmt",
+    "yuvj420p",
+    "-q:v",
+    "2",
+    outputJpg,
+  );
+  await execFileAsync(FFMPEG, args, { maxBuffer: 50 * 1024 * 1024 });
+}
+
+/** STEP 3 — 8 segment midpoints */
+async function extractEvenlySpaced(inputPath, sceneFramesDir, duration, isWebm) {
+  const paths = [];
+  for (let i = 0; i < EVEN_SPREAD_COUNT; i++) {
+    const t = ((i + 0.5) * duration) / EVEN_SPREAD_COUNT;
+    const out = path.join(sceneFramesDir, `even_${String(i + 1).padStart(3, "0")}.jpg`);
+    try {
+      await extractOneFrameAtTime(inputPath, out, t, isWebm);
+      paths.push(out);
+    } catch {
+      /* skip */
+    }
+  }
+  return paths.filter((p) => fssync.existsSync(p));
+}
+
+/** STEP 4 */
+async function extractFixedTimestamps(inputPath, sceneFramesDir, times, isWebm) {
+  const paths = [];
+  for (let i = 0; i < times.length; i++) {
+    const out = path.join(sceneFramesDir, `fixed_${String(i + 1).padStart(3, "0")}.jpg`);
+    try {
+      await extractOneFrameAtTime(inputPath, out, times[i], isWebm);
+      if (fssync.existsSync(out)) paths.push(out);
+    } catch {
+      /* skip */
+    }
+  }
   return paths;
+}
+
+/** @param {unknown} movementType */
+function fixedTimestampsForMovement(movementType) {
+  const mt = movementType == null ? "" : String(movementType).toLowerCase().trim();
+  if (mt === "shooting" || mt === "basketball") return [...FIXED_TIMESTAMPS.shooting];
+  if (mt === "deadlift" || mt === "rdl") return [...FIXED_TIMESTAMPS.deadlift];
+  return [...FIXED_TIMESTAMPS.default];
+}
+
+/**
+ * Universal motion-based extraction for all movement types.
+ * @returns {Promise<string[]>}
+ */
+async function extractFramePathsUniversal(inputPath, analysisId, movementType, isWebm) {
+  const sceneFramesDir = `/tmp/scene_${analysisId}`;
+  fssync.mkdirSync(sceneFramesDir, { recursive: true });
+
+  let framePaths = [];
+
+  // STEP 1 — scene 0.15
+  try {
+    await runSceneDetection(inputPath, sceneFramesDir, 0.15, isWebm);
+  } catch (err) {
+    console.error("[extract-frames] scene detection (0.15) failed:", err.message);
+  }
+  framePaths = await listSceneFrameJpegs(sceneFramesDir);
+  if (framePaths.length > SCENE_MAX_FRAMES) {
+    framePaths = subsampleEvenly(framePaths, SCENE_MAX_FRAMES);
+  }
+  if (framePaths.length >= SCENE_MIN_FRAMES) {
+    console.log("[frames] strategy: scene-detection, count:", framePaths.length);
+    return framePaths;
+  }
+
+  // STEP 2 — scene 0.08
+  await unlinkMatching(sceneFramesDir, /^frame_\d+\.jpg$/i);
+  try {
+    await runSceneDetection(inputPath, sceneFramesDir, 0.08, isWebm);
+  } catch (err) {
+    console.error("[extract-frames] scene detection (0.08) failed:", err.message);
+  }
+  framePaths = await listSceneFrameJpegs(sceneFramesDir);
+  if (framePaths.length > SCENE_MAX_FRAMES) {
+    framePaths = subsampleEvenly(framePaths, SCENE_MAX_FRAMES);
+  }
+  if (framePaths.length >= SCENE_MIN_FRAMES) {
+    console.log("[frames] strategy: scene-detection-low-threshold, count:", framePaths.length);
+    return framePaths;
+  }
+
+  await unlinkMatching(sceneFramesDir, /^frame_\d+\.jpg$/i);
+
+  // STEP 3 — evenly spaced (8 midpoints)
+  const duration = await getVideoDurationSec(inputPath, isWebm);
+  if (duration != null && Number.isFinite(duration) && duration > 0) {
+    framePaths = await extractEvenlySpaced(inputPath, sceneFramesDir, duration, isWebm);
+    console.log("[frames] strategy: evenly-spaced, duration:", duration);
+    if (framePaths.length >= SCENE_MIN_FRAMES) {
+      return framePaths;
+    }
+  }
+
+  // STEP 4 — fixed timestamps
+  await unlinkMatching(sceneFramesDir, /^even_\d+\.jpg$/i);
+  const fixedTimes = fixedTimestampsForMovement(movementType);
+  framePaths = await extractFixedTimestamps(inputPath, sceneFramesDir, fixedTimes, isWebm);
+  console.log("[frames] strategy: fixed-timestamps");
+  return framePaths;
 }
 
 /**
@@ -227,22 +374,13 @@ app.post("/extract-frames", async (req, res) => {
     return res.status(400).json({ error: "Invalid storagePath" });
   }
 
-  const strategy = resolveStrategy(movementType);
   const isWebm = isWebmPath(normalizedPath);
   const ext = path.extname(normalizedPath) || ".bin";
   const inputPath = path.join("/tmp", `${analysisId}${ext}`);
+  const sceneFramesDir = `/tmp/scene_${analysisId}`;
 
   /** @type {string[]} */
   let framePaths = [];
-  /** @type {number[]} */
-  let timesSec = [];
-
-  if (strategy === "squat") {
-    framePaths = SQUAT_FRAME_SECONDS.map((sec) =>
-      path.join("/tmp", `${analysisId}-frame-${sec}s.jpg`),
-    );
-    timesSec = [...SQUAT_FRAME_SECONDS];
-  }
 
   const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
@@ -272,88 +410,15 @@ app.post("/extract-frames", async (req, res) => {
     const buf = Buffer.from(await blob.arrayBuffer());
     await fs.writeFile(inputPath, buf);
 
-    const ffmpegBase = [
-      "-vframes",
-      "1",
-      "-vf",
-      VF_EXTRACT,
-      "-pix_fmt",
-      "yuvj420p",
-      "-q:v",
-      "2",
-    ];
+    framePaths = await extractFramePathsUniversal(
+      inputPath,
+      analysisId,
+      movementType,
+      isWebm,
+    );
 
-    if (strategy === "shooting") {
-      const sceneOutPattern = path.join("/tmp", `${analysisId}-scene-%03d.jpg`);
-      const sceneVf = "select=gt(scene\\,0.15),fps=30,scale=800:-1";
-
-      try {
-        await execFileAsync(
-          FFMPEG,
-          [
-            ...inputPrefixFlags(isWebm),
-            "-i",
-            inputPath,
-            "-vf",
-            sceneVf,
-            "-vsync",
-            "vfr",
-            "-pix_fmt",
-            "yuvj420p",
-            "-q:v",
-            "2",
-            sceneOutPattern,
-          ],
-          { maxBuffer: 50 * 1024 * 1024 },
-        );
-      } catch (err) {
-        console.error("[extract-frames] scene detection pass failed:", err.message);
-      }
-
-      let scenePaths = await listSceneFramePaths(analysisId);
-      if (scenePaths.length > SCENE_MAX_FRAMES) {
-        scenePaths = scenePaths.slice(0, SCENE_MAX_FRAMES);
-      }
-
-      if (scenePaths.length >= SCENE_MIN_FRAMES) {
-        framePaths = scenePaths;
-      } else {
-        const durationSec = await getVideoDurationSec(inputPath, isWebm);
-        if (durationSec == null || !Number.isFinite(durationSec) || durationSec <= 0) {
-          timesSec = [...FALLBACK_SHOOTING_SEEK_SEC];
-          console.log("[frames] duration method:", "fixed-fallback-shooting", timesSec.join(","));
-        } else {
-          timesSec = shootingFrameTimesSec(durationSec);
-        }
-        framePaths = Array.from({ length: SHOOTING_FRAME_COUNT }, (_, i) =>
-          path.join("/tmp", `${analysisId}-shooting-${i}.jpg`),
-        );
-        for (let i = 0; i < framePaths.length; i++) {
-          await execFileAsync(FFMPEG, [
-            "-ss",
-            String(timesSec[i]),
-            ...inputPrefixFlags(isWebm),
-            "-i",
-            inputPath,
-            ...ffmpegBase,
-            framePaths[i],
-          ]);
-        }
-      }
-    } else {
-      for (let i = 0; i < framePaths.length; i++) {
-        const t = timesSec[i];
-        const ss = `00:00:${String(t).padStart(2, "0")}`;
-        await execFileAsync(FFMPEG, [
-          "-ss",
-          ss,
-          ...inputPrefixFlags(isWebm),
-          "-i",
-          inputPath,
-          ...ffmpegBase,
-          framePaths[i],
-        ]);
-      }
+    if (framePaths.length === 0) {
+      return res.status(500).json({ error: "No frames extracted" });
     }
 
     const frames = await readFramePayloads(framePaths);
@@ -363,29 +428,18 @@ app.post("/extract-frames", async (req, res) => {
     console.error("[extract-frames]", err);
     return res.status(500).json({ error: "Frame extraction failed" });
   } finally {
-    const toRemove = new Set([inputPath, ...framePaths]);
     try {
-      const dir = "/tmp";
-      const prefix = `${analysisId}-scene-`;
-      const entries = await fs.readdir(dir);
-      for (const f of entries) {
-        if (f.startsWith(prefix) && f.endsWith(".jpg")) {
-          toRemove.add(path.join(dir, f));
-        }
-      }
-      for (let i = 0; i < SHOOTING_FRAME_COUNT; i++) {
-        toRemove.add(path.join("/tmp", `${analysisId}-shooting-${i}.jpg`));
+      if (fssync.existsSync(inputPath)) {
+        await fs.unlink(inputPath).catch(() => {});
       }
     } catch {
       /* ignore */
     }
-    await Promise.all(
-      [...toRemove].map((p) =>
-        fs.unlink(p).catch(() => {
-          /* ignore */
-        }),
-      ),
-    );
+    try {
+      await fs.rm(sceneFramesDir, { recursive: true, force: true });
+    } catch {
+      /* ignore */
+    }
   }
 });
 

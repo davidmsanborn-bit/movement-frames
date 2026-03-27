@@ -13,8 +13,13 @@ const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 const STORAGE_BUCKET = process.env.SUPABASE_STORAGE_BUCKET || "videos";
 
+/** Default `ffmpeg` on Linux/Railway; set e.g. `/opt/homebrew/bin/ffmpeg` locally if needed */
+const FFMPEG = process.env.FFMPEG_PATH || "ffmpeg";
+
 const SQUAT_FRAME_SECONDS = [1, 2, 3];
 const SHOOTING_FRAME_COUNT = 8;
+const SCENE_MIN_FRAMES = 4;
+const SCENE_MAX_FRAMES = 10;
 
 function isSafeId(value) {
   return typeof value === "string" && /^[a-zA-Z0-9._-]+$/.test(value) && value.length <= 256;
@@ -43,7 +48,7 @@ function resolveStrategy(movementType) {
 async function getVideoDurationSec(inputPath) {
   let combined = "";
   try {
-    await execFileAsync("ffmpeg", ["-i", inputPath], { maxBuffer: 10 * 1024 * 1024 });
+    await execFileAsync(FFMPEG, ["-i", inputPath], { maxBuffer: 10 * 1024 * 1024 });
   } catch (err) {
     const stderr = err.stderr != null ? Buffer.from(err.stderr).toString() : "";
     const stdout = err.stdout != null ? Buffer.from(err.stdout).toString() : "";
@@ -65,6 +70,49 @@ function shootingFrameTimesSec(durationSec) {
     times.push(((i + 0.5) / n) * durationSec);
   }
   return times;
+}
+
+/**
+ * List /tmp/{analysisId}-scene-NNN.jpg from scene-detect pass, sorted by frame number.
+ * @param {string} analysisId
+ * @returns {Promise<string[]>}
+ */
+async function listSceneFramePaths(analysisId) {
+  const dir = "/tmp";
+  const prefix = `${analysisId}-scene-`;
+  let entries;
+  try {
+    entries = await fs.readdir(dir);
+  } catch {
+    return [];
+  }
+  const paths = entries
+    .filter((f) => f.startsWith(prefix) && f.endsWith(".jpg"))
+    .map((f) => {
+      const m = f.match(/-scene-(\d+)\.jpg$/);
+      const n = m ? parseInt(m[1], 10) : NaN;
+      return { n, p: path.join(dir, f) };
+    })
+    .filter((x) => Number.isFinite(x.n))
+    .sort((a, b) => a.n - b.n)
+    .map((x) => x.p);
+  return paths;
+}
+
+/**
+ * @param {string[]} paths
+ * @returns {Promise<{ base64: string, mediaType: string }[]>}
+ */
+async function readFramePayloads(paths) {
+  const frames = [];
+  for (const p of paths) {
+    const jpeg = await fs.readFile(p);
+    frames.push({
+      base64: jpeg.toString("base64"),
+      mediaType: "image/jpeg",
+    });
+  }
+  return frames;
 }
 
 const app = express();
@@ -108,11 +156,6 @@ app.post("/extract-frames", async (req, res) => {
       path.join("/tmp", `${analysisId}-frame-${sec}s.jpg`),
     );
     timesSec = [...SQUAT_FRAME_SECONDS];
-  } else {
-    framePaths = Array.from({ length: SHOOTING_FRAME_COUNT }, (_, i) =>
-      path.join("/tmp", `${analysisId}-shooting-${i}.jpg`),
-    );
-    timesSec = []; // filled after download + duration
   }
 
   const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
@@ -143,14 +186,6 @@ app.post("/extract-frames", async (req, res) => {
     const buf = Buffer.from(await blob.arrayBuffer());
     await fs.writeFile(inputPath, buf);
 
-    if (strategy === "shooting") {
-      const durationSec = await getVideoDurationSec(inputPath);
-      if (durationSec == null || !Number.isFinite(durationSec) || durationSec <= 0) {
-        return res.status(422).json({ error: "Could not read video duration" });
-      }
-      timesSec = shootingFrameTimesSec(durationSec);
-    }
-
     const ffmpegBase = [
       "-vframes",
       "1",
@@ -162,32 +197,92 @@ app.post("/extract-frames", async (req, res) => {
       "2",
     ];
 
-    for (let i = 0; i < framePaths.length; i++) {
-      const t = timesSec[i];
-      const ss =
-        strategy === "squat"
-          ? `00:00:${String(t).padStart(2, "0")}`
-          : String(t);
-      await execFileAsync("ffmpeg", ["-ss", ss, "-i", inputPath, ...ffmpegBase, framePaths[i]]);
+    if (strategy === "shooting") {
+      const sceneOutPattern = path.join("/tmp", `${analysisId}-scene-%03d.jpg`);
+      const sceneVf = "select=gt(scene\\,0.15),scale=800:-1";
+
+      try {
+        await execFileAsync(
+          FFMPEG,
+          [
+            "-i",
+            inputPath,
+            "-vf",
+            sceneVf,
+            "-vsync",
+            "vfr",
+            "-pix_fmt",
+            "yuvj420p",
+            "-q:v",
+            "2",
+            sceneOutPattern,
+          ],
+          { maxBuffer: 50 * 1024 * 1024 },
+        );
+      } catch (err) {
+        console.error("[extract-frames] scene detection pass failed:", err.message);
+      }
+
+      let scenePaths = await listSceneFramePaths(analysisId);
+      if (scenePaths.length > SCENE_MAX_FRAMES) {
+        scenePaths = scenePaths.slice(0, SCENE_MAX_FRAMES);
+      }
+
+      if (scenePaths.length >= SCENE_MIN_FRAMES) {
+        framePaths = scenePaths;
+      } else {
+        const durationSec = await getVideoDurationSec(inputPath);
+        if (durationSec == null || !Number.isFinite(durationSec) || durationSec <= 0) {
+          return res.status(422).json({ error: "Could not read video duration" });
+        }
+        timesSec = shootingFrameTimesSec(durationSec);
+        framePaths = Array.from({ length: SHOOTING_FRAME_COUNT }, (_, i) =>
+          path.join("/tmp", `${analysisId}-shooting-${i}.jpg`),
+        );
+        for (let i = 0; i < framePaths.length; i++) {
+          await execFileAsync(FFMPEG, [
+            "-ss",
+            String(timesSec[i]),
+            "-i",
+            inputPath,
+            ...ffmpegBase,
+            framePaths[i],
+          ]);
+        }
+      }
+    } else {
+      for (let i = 0; i < framePaths.length; i++) {
+        const t = timesSec[i];
+        const ss = `00:00:${String(t).padStart(2, "0")}`;
+        await execFileAsync(FFMPEG, ["-ss", ss, "-i", inputPath, ...ffmpegBase, framePaths[i]]);
+      }
     }
 
-    const frames = [];
-    for (const p of framePaths) {
-      const jpeg = await fs.readFile(p);
-      frames.push({
-        base64: jpeg.toString("base64"),
-        mediaType: "image/jpeg",
-      });
-    }
+    const frames = await readFramePayloads(framePaths);
 
     return res.json({ frames });
   } catch (err) {
     console.error("[extract-frames]", err);
     return res.status(500).json({ error: "Frame extraction failed" });
   } finally {
-    const toRemove = [inputPath, ...framePaths];
+    const toRemove = new Set([inputPath, ...framePaths]);
+    try {
+      const dir = "/tmp";
+      const prefix = `${analysisId}-scene-`;
+      const entries = await fs.readdir(dir);
+      for (const f of entries) {
+        if (f.startsWith(prefix) && f.endsWith(".jpg")) {
+          toRemove.add(path.join(dir, f));
+        }
+      }
+      for (let i = 0; i < SHOOTING_FRAME_COUNT; i++) {
+        toRemove.add(path.join("/tmp", `${analysisId}-shooting-${i}.jpg`));
+      }
+    } catch {
+      /* ignore */
+    }
     await Promise.all(
-      toRemove.map((p) =>
+      [...toRemove].map((p) =>
         fs.unlink(p).catch(() => {
           /* ignore */
         }),

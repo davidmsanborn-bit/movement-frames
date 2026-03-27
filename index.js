@@ -21,6 +21,9 @@ const SHOOTING_FRAME_COUNT = 8;
 const SCENE_MIN_FRAMES = 4;
 const SCENE_MAX_FRAMES = 10;
 
+/** When duration cannot be read (e.g. some .webm), use fixed seeks instead of failing */
+const FALLBACK_SHOOTING_SEEK_SEC = [0.5, 1.5, 2.5, 3.5, 4.5, 5.5, 6.5, 7.5];
+
 function isSafeId(value) {
   return typeof value === "string" && /^[a-zA-Z0-9._-]+$/.test(value) && value.length <= 256;
 }
@@ -41,25 +44,32 @@ function resolveStrategy(movementType) {
 }
 
 /**
- * ffmpeg -i prints Duration to stderr and exits non-zero when no output is given.
+ * Same idea as `ffmpeg -i file 2>&1` (probe metadata). Duration is on stderr.
  * @param {string} inputPath
- * @returns {Promise<number | null>}
+ * @returns {Promise<number | null>} null if no Duration line matched
  */
 async function getVideoDurationSec(inputPath) {
-  let combined = "";
+  let stderr = "";
+  let stdout = "";
   try {
-    await execFileAsync(FFMPEG, ["-i", inputPath], { maxBuffer: 10 * 1024 * 1024 });
+    const r = await execFileAsync(FFMPEG, ["-i", inputPath], { maxBuffer: 10 * 1024 * 1024 });
+    stderr = r.stderr != null ? Buffer.from(r.stderr).toString() : "";
+    stdout = r.stdout != null ? Buffer.from(r.stdout).toString() : "";
   } catch (err) {
-    const stderr = err.stderr != null ? Buffer.from(err.stderr).toString() : "";
-    const stdout = err.stdout != null ? Buffer.from(err.stdout).toString() : "";
-    combined = stderr + stdout;
+    stderr = err.stderr != null ? Buffer.from(err.stderr).toString() : "";
+    stdout = err.stdout != null ? Buffer.from(err.stdout).toString() : "";
   }
-  const m = combined.match(/Duration:\s*(\d{1,2}):(\d{2}):(\d{2}\.\d+)/);
-  if (!m) return null;
-  const h = parseInt(m[1], 10);
-  const min = parseInt(m[2], 10);
-  const sec = parseFloat(m[3]);
-  return h * 3600 + min * 60 + sec;
+
+  console.log("[frames] ffmpeg stderr:", stderr.slice(0, 500));
+
+  const combined = stderr + stdout;
+  const durationMatch = combined.match(/Duration:\s*(\d+):(\d+):(\d+\.?\d*)/);
+  if (!durationMatch) return null;
+  const hours = parseFloat(durationMatch[1]);
+  const minutes = parseFloat(durationMatch[2]);
+  const seconds = parseFloat(durationMatch[3]);
+  const durationSec = hours * 3600 + minutes * 60 + seconds;
+  return Number.isFinite(durationSec) ? durationSec : null;
 }
 
 /** @param {number} durationSec */
@@ -233,9 +243,10 @@ app.post("/extract-frames", async (req, res) => {
       } else {
         const durationSec = await getVideoDurationSec(inputPath);
         if (durationSec == null || !Number.isFinite(durationSec) || durationSec <= 0) {
-          return res.status(422).json({ error: "Could not read video duration" });
+          timesSec = [...FALLBACK_SHOOTING_SEEK_SEC];
+        } else {
+          timesSec = shootingFrameTimesSec(durationSec);
         }
-        timesSec = shootingFrameTimesSec(durationSec);
         framePaths = Array.from({ length: SHOOTING_FRAME_COUNT }, (_, i) =>
           path.join("/tmp", `${analysisId}-shooting-${i}.jpg`),
         );

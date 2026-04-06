@@ -716,7 +716,141 @@ app.post("/extract-frames", async (req, res) => {
     }
   }
 });
+// ─── Game Film Frame Extraction ────────────────────────────────────────────
 
+async function downloadGameVideoToTemp(storagePath, gameId) {
+  const supabase = getSupabase();
+  const { data, error } = await supabase.storage
+    .from("game-videos")
+    .download(storagePath);
+  if (error || !data) {
+    throw new Error(error?.message || "Failed to download game video from storage");
+  }
+  const buf = Buffer.from(await data.arrayBuffer());
+  const ext = path.extname(storagePath) || ".mp4";
+  const inputPath = path.join(os.tmpdir(), `game_input_${gameId}${ext}`);
+  await fs.promises.writeFile(inputPath, buf);
+  return inputPath;
+}
+
+async function extractGameFilmFrames(inputPath, gameId) {
+  const workingPath = await normalizeVideo(inputPath, gameId);
+  const normalizedToCleanup = workingPath !== inputPath ? workingPath : null;
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), `gameframes_${gameId}_`));
+
+  try {
+    const duration = await getDurationSeconds(workingPath);
+    if (!duration || duration <= 0) {
+      throw new Error("Could not determine game video duration");
+    }
+
+    console.log(`[game-frames] duration: ${duration}s (${Math.round(duration / 60)}min)`);
+
+    // Strategy: 1 frame per 10 seconds for full game
+    // Plus denser coverage (1 per 3s) for first 5 minutes to capture lineups
+    const frames = [];
+    const addedTimes = new Set();
+
+    // Dense first-5-min coverage (lineup identification)
+    const denseEnd = Math.min(300, duration);
+    for (let t = 3; t < denseEnd; t += 3) {
+      const rounded = Math.round(t);
+      if (!addedTimes.has(rounded)) {
+        frames.push(rounded);
+        addedTimes.add(rounded);
+      }
+    }
+
+    // 1 frame per 10 seconds for remainder
+    for (let t = 300; t < duration; t += 10) {
+      const rounded = Math.round(t);
+      if (!addedTimes.has(rounded)) {
+        frames.push(rounded);
+        addedTimes.add(rounded);
+      }
+    }
+
+    frames.sort((a, b) => a - b);
+    console.log(`[game-frames] extracting ${frames.length} frames`);
+
+    // Extract frames in batches of 20 to avoid memory pressure
+    const jpegPaths = [];
+    for (let i = 0; i < frames.length; i++) {
+      const t = frames[i];
+      const out = path.join(
+        tmpRoot,
+        `game_${gameId}_${String(i + 1).padStart(4, "0")}_t${t}.jpg`
+      );
+      try {
+        await extractSingleFrameAtTime(workingPath, out, t);
+        if (fs.existsSync(out)) {
+          jpegPaths.push({ path: out, timestamp_seconds: t });
+        }
+      } catch {
+        /* skip failed frame */
+      }
+    }
+
+    console.log(`[game-frames] extracted ${jpegPaths.length} frames successfully`);
+
+    if (jpegPaths.length === 0) {
+      throw new Error("No frames extracted from game video");
+    }
+
+    // Read as base64 payload — include timestamp metadata
+    const payload = [];
+    for (const { path: p, timestamp_seconds } of jpegPaths) {
+      const buf = await fs.promises.readFile(p);
+      payload.push({
+        base64: buf.toString("base64"),
+        mediaType: "image/jpeg",
+        timestamp_seconds,
+      });
+    }
+
+    return payload;
+
+  } finally {
+    try { fs.rmSync(tmpRoot, { recursive: true, force: true }); } catch { /* */ }
+    if (normalizedToCleanup) {
+      try { fs.rmSync(normalizedToCleanup, { force: true }); } catch { /* */ }
+    }
+  }
+}
+
+app.post("/extract-game-film-frames", async (req, res) => {
+  const auth = req.headers.authorization || "";
+  const secret = process.env.FRAMES_SERVICE_SECRET;
+  if (!secret || auth !== `Bearer ${secret}`) {
+    return res.status(401).json({ error: "Unauthorized" });
+  }
+
+  const { gameId, storagePath } = req.body || {};
+  if (typeof gameId !== "string" || !gameId.trim()) {
+    return res.status(400).json({ error: "gameId required" });
+  }
+  if (typeof storagePath !== "string" || !storagePath.trim()) {
+    return res.status(400).json({ error: "storagePath required" });
+  }
+
+  let inputPath = null;
+  try {
+    console.log(`[game-frames] starting extraction for game ${gameId}`);
+    inputPath = await downloadGameVideoToTemp(storagePath.trim(), gameId.trim());
+    const frames = await extractGameFilmFrames(inputPath, gameId.trim());
+    console.log(`[game-frames] complete: ${frames.length} frames for game ${gameId}`);
+    return res.json({ frames, frame_count: frames.length });
+  } catch (err) {
+    console.error("[extract-game-film-frames]", err);
+    return res.status(500).json({
+      error: err instanceof Error ? err.message : "Game film extraction failed",
+    });
+  } finally {
+    if (inputPath && fs.existsSync(inputPath)) {
+      try { fs.unlinkSync(inputPath); } catch { /* */ }
+    }
+  }
+});
 app.listen(PORT, () => {
   console.log(`[frames] listening on ${PORT}`);
 });

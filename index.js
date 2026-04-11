@@ -677,7 +677,7 @@ app.get("/health", (_req, res) => {
 
 app.post("/extract-frames", async (req, res) => {
   const auth = req.headers.authorization || "";
-  const secret = process.env.FRAMES_SERVICE_SECRET;
+  const secret = process.env.SERVICE_SECRET;
   if (!secret || auth !== `Bearer ${secret}`) {
     return res.status(401).json({ error: "Unauthorized" });
   }

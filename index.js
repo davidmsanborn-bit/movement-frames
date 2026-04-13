@@ -865,6 +865,7 @@ async function detectSceneWindows(inputPath, gameId) {
         `Video too long for Sprint 28 pipeline: ${Math.round(duration)}s (max 1800s / 30min). Shorter clips supported; longer game films in Sprint 29+.`,
       );
     }
+    console.log(`[detect-scenes] scene_threshold=0.08 duration=${Math.round(duration)}s for ${gameId}`);
 
     const sceneChanges = [];
     let fullStderr = "";
@@ -876,7 +877,7 @@ async function detectSceneWindows(inputPath, gameId) {
         "-loglevel", "info",
         "-i", workingPath,
         "-an",
-        "-filter:v", "select='gt(scene,0.2)',showinfo",
+        "-filter:v", "select='gt(scene,0.08)',showinfo",
         "-f", "null",
         "-"
       ]);
@@ -967,6 +968,24 @@ async function detectSceneWindows(inputPath, gameId) {
     }
 
     console.log(`[detect-scenes] produced ${scenes.length} play windows for ${gameId}`);
+    if (scenes.length === 0) {
+      console.log(`[detect-scenes] no scene changes — falling back to uniform 10s windows for ${gameId}`);
+      const WINDOW_SEC = 10;
+      const OVERLAP_SEC = 2;
+      const STEP = WINDOW_SEC - OVERLAP_SEC;
+      for (let t = 0; t < duration; t += STEP) {
+        const start = t;
+        const end = Math.min(duration, t + WINDOW_SEC);
+        if (end - start < 3) continue;
+        scenes.push({
+          start_sec: Math.round(start * 10) / 10,
+          end_sec: Math.round(end * 10) / 10,
+          confidence: 0.5,
+          source: "uniform_fallback",
+        });
+      }
+      console.log(`[detect-scenes] fallback produced ${scenes.length} uniform windows for ${gameId}`);
+    }
     return scenes;
   } finally {
     if (normalizedToCleanup) {

@@ -875,6 +875,7 @@ async function detectSceneWindows(inputPath, gameId) {
         "-hide_banner",
         "-loglevel", "info",
         "-i", workingPath,
+        "-an",
         "-filter:v", "select='gt(scene,0.2)',showinfo",
         "-f", "null",
         "-"

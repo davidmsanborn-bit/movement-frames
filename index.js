@@ -860,31 +860,48 @@ async function detectSceneWindows(inputPath, gameId) {
     if (!duration || duration <= 0) {
       throw new Error("Could not determine video duration");
     }
+    if (duration > 1800) {
+      throw new Error(
+        `Video too long for Sprint 28 pipeline: ${Math.round(duration)}s (max 1800s / 30min). Shorter clips supported; longer game films in Sprint 29+.`,
+      );
+    }
 
     const sceneChanges = [];
+    let fullStderr = "";
     let stderrBuf = "";
 
     await new Promise((resolve, reject) => {
       const proc = spawn(FFMPEG_PATH, [
+        "-hide_banner",
+        "-loglevel", "info",
         "-i", workingPath,
         "-filter:v", "select='gt(scene,0.2)',showinfo",
         "-f", "null",
         "-"
       ]);
       proc.stderr.on("data", (chunk) => {
-        stderrBuf += chunk.toString();
+        const text = chunk.toString();
+        fullStderr += text;
+        if (fullStderr.length > 1_000_000) {
+          fullStderr = "...[truncated]..." + fullStderr.slice(-500_000);
+        }
+        stderrBuf += text;
         const matches = stderrBuf.matchAll(/pts_time:([0-9.]+)/g);
         for (const m of matches) {
           const t = parseFloat(m[1]);
           if (!isNaN(t) && !sceneChanges.includes(t)) sceneChanges.push(t);
         }
-        // Drain buffer to prevent re-matching same data
+        // Drain at last newline to avoid re-matching
         const lastNewline = stderrBuf.lastIndexOf("\n");
         if (lastNewline > 0) stderrBuf = stderrBuf.slice(lastNewline);
       });
       proc.on("close", (code) => {
-        if (code === 0) resolve();
-        else reject(new Error(`ffmpeg scene detect exited ${code}`));
+        if (code === 0) {
+          resolve();
+        } else {
+          const tail = fullStderr.slice(-500);
+          reject(new Error(`ffmpeg scene detect exited ${code}. stderr tail: ${tail}`));
+        }
       });
       proc.on("error", reject);
     });

@@ -7,7 +7,7 @@ const express = require("express");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
-const { execFile } = require("child_process");
+const { execFile, spawn } = require("child_process");
 const { promisify } = require("util");
 const { createClient } = require("@supabase/supabase-js");
 
@@ -851,6 +851,145 @@ app.post("/extract-game-film-frames", async (req, res) => {
     }
   }
 });
+
+async function detectSceneWindows(inputPath, gameId) {
+  const workingPath = await normalizeVideo(inputPath, gameId);
+  const normalizedToCleanup = workingPath !== inputPath ? workingPath : null;
+  try {
+    const duration = await getDurationSeconds(workingPath);
+    if (!duration || duration <= 0) {
+      throw new Error("Could not determine video duration");
+    }
+
+    const sceneChanges = [];
+    let stderrBuf = "";
+
+    await new Promise((resolve, reject) => {
+      const proc = spawn(FFMPEG_PATH, [
+        "-i", workingPath,
+        "-filter:v", "select='gt(scene,0.2)',showinfo",
+        "-f", "null",
+        "-"
+      ]);
+      proc.stderr.on("data", (chunk) => {
+        stderrBuf += chunk.toString();
+        const matches = stderrBuf.matchAll(/pts_time:([0-9.]+)/g);
+        for (const m of matches) {
+          const t = parseFloat(m[1]);
+          if (!isNaN(t) && !sceneChanges.includes(t)) sceneChanges.push(t);
+        }
+        // Drain buffer to prevent re-matching same data
+        const lastNewline = stderrBuf.lastIndexOf("\n");
+        if (lastNewline > 0) stderrBuf = stderrBuf.slice(lastNewline);
+      });
+      proc.on("close", (code) => {
+        if (code === 0) resolve();
+        else reject(new Error(`ffmpeg scene detect exited ${code}`));
+      });
+      proc.on("error", reject);
+    });
+
+    sceneChanges.sort((a, b) => a - b);
+    console.log(`[detect-scenes] ${sceneChanges.length} scene change events for ${gameId}`);
+
+    // Group scene changes into play windows
+    const PLAY_GAP_SEC = 3;
+    const MIN_WINDOW_SEC = 3;
+    const MAX_WINDOW_SEC = 15;
+    const LEAD_IN_SEC = 1;
+    const LEAD_OUT_SEC = 2;
+
+    const rawWindows = [];
+    let windowStart = null;
+    let lastChange = null;
+
+    for (const t of sceneChanges) {
+      if (windowStart === null) {
+        windowStart = t;
+        lastChange = t;
+        continue;
+      }
+      if (t - lastChange > PLAY_GAP_SEC) {
+        rawWindows.push({ firstChange: windowStart, lastChange });
+        windowStart = t;
+      }
+      lastChange = t;
+    }
+    if (windowStart !== null && lastChange !== null) {
+      rawWindows.push({ firstChange: windowStart, lastChange });
+    }
+
+    // Apply lead-in/out, clamp to duration, split long windows, filter short ones
+    const scenes = [];
+    for (const w of rawWindows) {
+      const start = Math.max(0, w.firstChange - LEAD_IN_SEC);
+      const end = Math.min(duration, w.lastChange + LEAD_OUT_SEC);
+      const span = end - start;
+      if (span < MIN_WINDOW_SEC) continue;
+
+      if (span <= MAX_WINDOW_SEC) {
+        scenes.push({
+          start_sec: Math.round(start * 10) / 10,
+          end_sec: Math.round(end * 10) / 10,
+          confidence: 1.0
+        });
+      } else {
+        const mid = start + span / 2;
+        scenes.push({
+          start_sec: Math.round(start * 10) / 10,
+          end_sec: Math.round(mid * 10) / 10,
+          confidence: 0.8
+        });
+        scenes.push({
+          start_sec: Math.round(mid * 10) / 10,
+          end_sec: Math.round(end * 10) / 10,
+          confidence: 0.8
+        });
+      }
+    }
+
+    console.log(`[detect-scenes] produced ${scenes.length} play windows for ${gameId}`);
+    return scenes;
+  } finally {
+    if (normalizedToCleanup) {
+      try { fs.rmSync(normalizedToCleanup, { force: true }); } catch { /* */ }
+    }
+  }
+}
+
+app.post("/detect-scenes", async (req, res) => {
+  const auth = req.headers.authorization || "";
+  const secret = process.env.FRAMES_SERVICE_SECRET;
+  if (!secret || auth !== `Bearer ${secret}`) {
+    return res.status(401).json({ error: "Unauthorized" });
+  }
+  const { gameId, storagePath } = req.body || {};
+  if (typeof gameId !== "string" || !gameId.trim()) {
+    return res.status(400).json({ error: "gameId required" });
+  }
+  if (typeof storagePath !== "string" || !storagePath.trim()) {
+    return res.status(400).json({ error: "storagePath required" });
+  }
+
+  let inputPath = null;
+  try {
+    console.log(`[detect-scenes] starting for game ${gameId}`);
+    inputPath = await downloadGameVideoToTemp(storagePath.trim(), gameId.trim());
+    const scenes = await detectSceneWindows(inputPath, gameId.trim());
+    console.log(`[detect-scenes] complete: ${scenes.length} windows for ${gameId}`);
+    return res.json({ scenes, scene_count: scenes.length });
+  } catch (err) {
+    console.error("[detect-scenes] error", err);
+    return res.status(500).json({
+      error: err instanceof Error ? err.message : "Scene detection failed",
+    });
+  } finally {
+    if (inputPath && fs.existsSync(inputPath)) {
+      try { fs.unlinkSync(inputPath); } catch { /* */ }
+    }
+  }
+});
+
 app.listen(PORT, () => {
   console.log(`[frames] listening on ${PORT}`);
 });

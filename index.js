@@ -1212,6 +1212,21 @@ app.post("/detect-scenes", async (req, res) => {
   }
 });
 
+app.get("/_debug/env-check", (_req, res) => {
+  res.json({
+    has_SUPABASE_URL: !!process.env.SUPABASE_URL,
+    has_NEXT_PUBLIC_SUPABASE_URL: !!process.env.NEXT_PUBLIC_SUPABASE_URL,
+    has_SUPABASE_SERVICE_ROLE_KEY: !!process.env.SUPABASE_SERVICE_ROLE_KEY,
+    has_SUPABASE_SERVICE_KEY: !!process.env.SUPABASE_SERVICE_KEY,
+    has_FRAMES_SERVICE_SECRET: !!process.env.FRAMES_SERVICE_SECRET,
+    visible_supabase_var_names: Object.keys(process.env)
+      .filter((k) => k.toLowerCase().includes("supabase"))
+      .sort(),
+    node_env: process.env.NODE_ENV || "not_set",
+    deployment_marker: "debug_endpoint_v1",
+  });
+});
+
 app.listen(PORT, () => {
   console.log(`[frames] listening on ${PORT}`);
 });

@@ -852,6 +852,68 @@ app.post("/extract-game-film-frames", async (req, res) => {
   }
 });
 
+async function detectMotionIntensity(inputPath, startSec, endSec) {
+  // Use ffmpeg signalstats filter to measure pixel-level activity.
+  // Higher activity = more motion = more action.
+  // Returns 0.0-1.0 normalized intensity.
+  return new Promise((resolve, reject) => {
+    const duration = endSec - startSec;
+    if (duration < 0.5) {
+      resolve(0.3);
+      return;
+    }
+
+    let stderr = "";
+    const proc = spawn(FFMPEG_PATH, [
+      "-hide_banner",
+      "-loglevel", "info",
+      "-ss", String(startSec),
+      "-t", String(duration),
+      "-i", inputPath,
+      "-an",
+      "-vf", "scale=320:180,signalstats,metadata=print",
+      "-f", "null",
+      "-",
+    ]);
+
+    proc.stderr.on("data", (chunk) => {
+      stderr += chunk.toString();
+      if (stderr.length > 500_000) {
+        stderr = "...[truncated]..." + stderr.slice(-200_000);
+      }
+    });
+
+    proc.on("close", (code) => {
+      if (code !== 0) {
+        reject(new Error(`motion detect ffmpeg exited ${code}`));
+        return;
+      }
+
+      // Parse YDIF (Y-channel frame difference) values from stderr.
+      // High YDIF = lots of frame-to-frame change = high motion.
+      const ydifMatches = stderr.matchAll(/lavfi\.signalstats\.YDIF=([0-9.]+)/g);
+      const ydifValues = [];
+      for (const m of ydifMatches) {
+        const v = parseFloat(m[1]);
+        if (!isNaN(v)) ydifValues.push(v);
+      }
+
+      if (ydifValues.length === 0) {
+        resolve(0.3); // No data, return default
+        return;
+      }
+
+      // Average YDIF, normalize to 0-1
+      // YDIF typically ranges 0-30 for normal video; 30+ = very high motion
+      const avgYdif = ydifValues.reduce((a, b) => a + b, 0) / ydifValues.length;
+      const normalized = Math.min(1.0, avgYdif / 30.0);
+      resolve(normalized);
+    });
+
+    proc.on("error", reject);
+  });
+}
+
 async function detectSceneWindows(inputPath, gameId) {
   const workingPath = await normalizeVideo(inputPath, gameId);
   const normalizedToCleanup = workingPath !== inputPath ? workingPath : null;
@@ -921,21 +983,34 @@ async function detectSceneWindows(inputPath, gameId) {
     const rawWindows = [];
     let windowStart = null;
     let lastChange = null;
+    let eventCount = 0;
 
     for (const t of sceneChanges) {
       if (windowStart === null) {
         windowStart = t;
         lastChange = t;
+        eventCount = 1;
         continue;
       }
       if (t - lastChange > PLAY_GAP_SEC) {
-        rawWindows.push({ firstChange: windowStart, lastChange });
+        rawWindows.push({
+          firstChange: windowStart,
+          lastChange,
+          eventCount,
+        });
         windowStart = t;
+        eventCount = 1;
+      } else {
+        eventCount += 1;
       }
       lastChange = t;
     }
     if (windowStart !== null && lastChange !== null) {
-      rawWindows.push({ firstChange: windowStart, lastChange });
+      rawWindows.push({
+        firstChange: windowStart,
+        lastChange,
+        eventCount,
+      });
     }
 
     // Apply lead-in/out, clamp to duration, split long windows, filter short ones
@@ -946,23 +1021,60 @@ async function detectSceneWindows(inputPath, gameId) {
       const span = end - start;
       if (span < MIN_WINDOW_SEC) continue;
 
+      // Intensity: events per second, normalized to 0.0-1.0
+      // 2+ events/sec = max intensity (1.0); tunable.
+      const eventsPerSecond = w.eventCount / Math.max(span, 0.1);
+      const intensityScore = Math.min(1.0, eventsPerSecond / 2.0);
+
+      // Scene type heuristic from intensity
+      const sceneType =
+        intensityScore >= 0.7
+          ? "action"
+          : intensityScore >= 0.4
+            ? "transition"
+            : "uniform";
+
       if (span <= MAX_WINDOW_SEC) {
         scenes.push({
           start_sec: Math.round(start * 10) / 10,
           end_sec: Math.round(end * 10) / 10,
-          confidence: 1.0
+          confidence: 1.0,
+          intensity_score: Math.round(intensityScore * 100) / 100,
+          scene_change_count: w.eventCount,
+          duration_sec: Math.round(span * 10) / 10,
+          scene_type: sceneType,
         });
       } else {
+        // Split long windows; intensity divided across halves
         const mid = start + span / 2;
+        const halfSpan = span / 2;
+        const halfEvents = Math.round(w.eventCount / 2);
+        const halfEventsPerSec = halfEvents / Math.max(halfSpan, 0.1);
+        const halfIntensity = Math.min(1.0, halfEventsPerSec / 2.0);
+        const halfSceneType =
+          halfIntensity >= 0.7
+            ? "action"
+            : halfIntensity >= 0.4
+              ? "transition"
+              : "uniform";
+
         scenes.push({
           start_sec: Math.round(start * 10) / 10,
           end_sec: Math.round(mid * 10) / 10,
-          confidence: 0.8
+          confidence: 0.8,
+          intensity_score: Math.round(halfIntensity * 100) / 100,
+          scene_change_count: halfEvents,
+          duration_sec: Math.round(halfSpan * 10) / 10,
+          scene_type: halfSceneType,
         });
         scenes.push({
           start_sec: Math.round(mid * 10) / 10,
           end_sec: Math.round(end * 10) / 10,
-          confidence: 0.8
+          confidence: 0.8,
+          intensity_score: Math.round(halfIntensity * 100) / 100,
+          scene_change_count: halfEvents,
+          duration_sec: Math.round(halfSpan * 10) / 10,
+          scene_type: halfSceneType,
         });
       }
     }
@@ -973,18 +1085,66 @@ async function detectSceneWindows(inputPath, gameId) {
       const WINDOW_SEC = 10;
       const OVERLAP_SEC = 2;
       const STEP = WINDOW_SEC - OVERLAP_SEC;
+
+      const enableMotionDetection =
+        process.env.ENABLE_MOTION_DETECTION_FALLBACK !== "false";
+
+      const motionStartTime = Date.now();
+      const candidateWindows = [];
       for (let t = 0; t < duration; t += STEP) {
         const start = t;
         const end = Math.min(duration, t + WINDOW_SEC);
         if (end - start < 3) continue;
+        candidateWindows.push({ start, end });
+      }
+
+      console.log(
+        `[detect-scenes] fallback: ${candidateWindows.length} candidate windows, motion_detection=${enableMotionDetection}`,
+      );
+
+      for (const w of candidateWindows) {
+        let intensityScore = 0.3; // default fallback intensity
+        let sceneType = "uniform";
+
+        if (enableMotionDetection) {
+          try {
+            // Run lightweight motion detection on this window
+            // Use ffmpeg signalstats to measure pixel-level activity
+            const motionScore = await detectMotionIntensity(
+              workingPath,
+              w.start,
+              w.end,
+            );
+            intensityScore = motionScore;
+            sceneType =
+              motionScore >= 0.7
+                ? "action"
+                : motionScore >= 0.4
+                  ? "transition"
+                  : "uniform";
+          } catch (motionErr) {
+            console.log(
+              `[detect-scenes] motion detection failed for window ${w.start}-${w.end}: ${motionErr.message}; using default 0.3`,
+            );
+          }
+        }
+
         scenes.push({
-          start_sec: Math.round(start * 10) / 10,
-          end_sec: Math.round(end * 10) / 10,
+          start_sec: Math.round(w.start * 10) / 10,
+          end_sec: Math.round(w.end * 10) / 10,
           confidence: 0.5,
           source: "uniform_fallback",
+          intensity_score: Math.round(intensityScore * 100) / 100,
+          duration_sec: Math.round((w.end - w.start) * 10) / 10,
+          scene_type: sceneType,
         });
       }
-      console.log(`[detect-scenes] fallback produced ${scenes.length} uniform windows for ${gameId}`);
+
+      const motionElapsedSec = (Date.now() - motionStartTime) / 1000;
+      console.log(
+        `[detect-scenes] fallback produced ${scenes.length} windows in ${motionElapsedSec.toFixed(1)}s ` +
+          `(motion_detection=${enableMotionDetection})`,
+      );
     }
     return scenes;
   } finally {
@@ -1014,7 +1174,32 @@ app.post("/detect-scenes", async (req, res) => {
     inputPath = await downloadGameVideoToTemp(storagePath.trim(), gameId.trim());
     const scenes = await detectSceneWindows(inputPath, gameId.trim());
     console.log(`[detect-scenes] complete: ${scenes.length} windows for ${gameId}`);
-    return res.json({ scenes, scene_count: scenes.length });
+
+    // Compute response metadata
+    const totalSceneChanges = scenes.reduce(
+      (sum, s) => sum + (s.scene_change_count || 0),
+      0,
+    );
+    const fallbackUsed = scenes.some((s) => s.source === "uniform_fallback");
+    const sceneDetected = scenes.some((s) => s.source !== "uniform_fallback");
+    const detectionMethod =
+      fallbackUsed && sceneDetected
+        ? "mixed"
+        : fallbackUsed
+          ? "uniform_fallback"
+          : "scene_detection";
+
+    // Get duration from last scene end (timeline coverage for sampling)
+    const lastScene = scenes[scenes.length - 1];
+    const durationSec = lastScene ? lastScene.end_sec : 0;
+
+    return res.json({
+      scenes,
+      scene_count: scenes.length,
+      duration_sec: durationSec,
+      total_scene_changes: totalSceneChanges,
+      detection_method: detectionMethod,
+    });
   } catch (err) {
     console.error("[detect-scenes] error", err);
     return res.status(500).json({

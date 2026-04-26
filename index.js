@@ -904,9 +904,15 @@ async function detectMotionIntensity(inputPath, startSec, endSec) {
       }
 
       // Average YDIF, normalize to 0-1
-      // YDIF typically ranges 0-30 for normal video; 30+ = very high motion
+      // Empirical calibration from Mason 21s wide-angle basketball clip:
+      // YDIF range 2.7-4.2 mapped through divisor=5 gives 0.54-0.84
+      // (transition to action range — appropriate for active play)
+      // Note: wide-angle shots dilute YDIF (static background pixels
+      // average down with player motion). Future: clip-type-aware
+      // calibration via S-clip-type-classification (parking lot).
+      // Tunable as we gather data from diverse upload types.
       const avgYdif = ydifValues.reduce((a, b) => a + b, 0) / ydifValues.length;
-      const normalized = Math.min(1.0, avgYdif / 30.0);
+      const normalized = Math.min(1.0, avgYdif / 5.0);
       resolve(normalized);
     });
 

@@ -912,7 +912,27 @@ async function detectMotionIntensity(inputPath, startSec, endSec) {
       // calibration via S-clip-type-classification (parking lot).
       // Tunable as we gather data from diverse upload types.
       const avgYdif = ydifValues.reduce((a, b) => a + b, 0) / ydifValues.length;
+      // Sort for percentile snapshot.
+      const sorted = [...ydifValues].sort((a, b) => a - b);
+      const p10 = sorted[Math.floor(sorted.length * 0.1)] ?? 0;
+      const p50 = sorted[Math.floor(sorted.length * 0.5)] ?? 0;
+      const p90 = sorted[Math.floor(sorted.length * 0.9)] ?? 0;
+      const ymax = sorted[sorted.length - 1] ?? 0;
       const normalized = Math.min(1.0, avgYdif / 5.0);
+      // S-frame-service-ydif-instrumentation: log raw distribution for
+      // calibration. Today's divisor=5 was tuned on a 21s Mason clip.
+      // Need cross-clip data before retuning.
+      console.log("[motion-intensity]", JSON.stringify({
+        startSec: Math.round(startSec * 10) / 10,
+        endSec: Math.round(endSec * 10) / 10,
+        sample_count: ydifValues.length,
+        avg: Math.round(avgYdif * 100) / 100,
+        p10: Math.round(p10 * 100) / 100,
+        p50: Math.round(p50 * 100) / 100,
+        p90: Math.round(p90 * 100) / 100,
+        max: Math.round(ymax * 100) / 100,
+        normalized: Math.round(normalized * 100) / 100,
+      }));
       resolve(normalized);
     });
 

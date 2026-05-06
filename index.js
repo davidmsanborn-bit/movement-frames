@@ -928,9 +928,9 @@ async function detectSceneWindows(inputPath, gameId) {
     if (!duration || duration <= 0) {
       throw new Error("Could not determine video duration");
     }
-    if (duration > 1800) {
+    if (duration > 7200) {
       throw new Error(
-        `Video too long for Sprint 28 pipeline: ${Math.round(duration)}s (max 1800s / 30min). Shorter clips supported; longer game films in Sprint 29+.`,
+        `Video too long: ${Math.round(duration)}s (max 7200s / 2hr). Contact support for longer videos.`,
       );
     }
     console.log(`[detect-scenes] scene_threshold=0.08 duration=${Math.round(duration)}s for ${gameId}`);

@@ -7,6 +7,9 @@ const express = require("express");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
+const { Readable } = require("stream");
+const { pipeline } = require("stream/promises");
+const { randomUUID } = require("crypto");
 const { execFile, spawn } = require("child_process");
 const { promisify } = require("util");
 const { createClient } = require("@supabase/supabase-js");
@@ -30,6 +33,26 @@ const FIXED_FALLBACK = {
 const UNIFORM_SEGMENT_COUNT = 10;
 /** If coefficient of variation of JPEG file sizes is below this, treat frames as too similar. */
 const LOW_VARIANCE_MAX_CV = 0.035;
+const GAME_CROPS_MAX_REQUEST = 100;
+const GAME_CROPS_SIGNED_URL_TTL_SEC = 60 * 60;
+const GAME_CROPS_MIN_EDGE_PX = 32;
+const GAME_CROPS_JPEG_QUALITY = 85;
+const CENTER_CROP_WIDTH_RATIO = 0.08;
+const CENTER_CROP_HEIGHT_RATIO = 0.32;
+const CENTER_CROP_MIN_WIDTH_PX = 96;
+const CENTER_CROP_MAX_WIDTH_PX = 220;
+const CENTER_CROP_MIN_HEIGHT_PX = 220;
+const CENTER_CROP_MAX_HEIGHT_PX = 460;
+const CENTER_CROP_UPWARD_BIAS_RATIO = 0.05;
+const BBOX_EXPAND_X_PER_SIDE_RATIO = 0.08;
+const BBOX_EXPAND_TOP_RATIO = 0.06;
+const BBOX_EXPAND_BOTTOM_RATIO = 0.04;
+const BBOX_JERSEY_LEFT_RATIO = 0.15;
+const BBOX_JERSEY_RIGHT_RATIO = 0.85;
+const BBOX_JERSEY_TOP_HEIGHT_RATIO = 0.55;
+const CENTER_JERSEY_LEFT_RATIO = 0.14;
+const CENTER_JERSEY_RIGHT_RATIO = 0.86;
+const CENTER_JERSEY_TOP_HEIGHT_RATIO = 0.58;
 
 function isWebm(filePath) {
   return path.extname(filePath).toLowerCase() === ".webm";
@@ -42,6 +65,314 @@ function ffmpegInputArgs(inputPath) {
   }
   args.push("-i", inputPath);
   return args;
+}
+
+function parseRateToFps(rate) {
+  if (typeof rate !== "string" || !rate.trim()) return 0;
+  const parts = rate.split("/");
+  if (parts.length === 2) {
+    const num = Number(parts[0]);
+    const den = Number(parts[1]);
+    if (Number.isFinite(num) && Number.isFinite(den) && den > 0) {
+      return num / den;
+    }
+  }
+  const parsed = Number(rate);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
+}
+
+function clamp(value, min, max) {
+  return Math.max(min, Math.min(max, value));
+}
+
+function isFiniteNumber(value) {
+  return typeof value === "number" && Number.isFinite(value);
+}
+
+function ffmpegQScaleFromJpegQuality(quality) {
+  const q = clamp(Math.round(quality), 1, 100);
+  const mapped = Math.round(((100 - q) / 99) * 29 + 2);
+  return String(clamp(mapped, 2, 31));
+}
+
+function sanitizeTmpId(value) {
+  return String(value || "")
+    .replace(/[^a-zA-Z0-9_-]/g, "_")
+    .slice(0, 128);
+}
+
+async function getVideoMetadata(inputPath) {
+  const { stdout } = await execFileAsync(
+    FFPROBE,
+    [
+      "-v",
+      "error",
+      "-print_format",
+      "json",
+      "-show_streams",
+      "-show_format",
+      inputPath,
+    ],
+    { maxBuffer: 20 * 1024 * 1024 },
+  );
+  const parsed = JSON.parse(String(stdout || "{}"));
+  const streams = Array.isArray(parsed.streams) ? parsed.streams : [];
+  const videoStream = streams.find((s) => s && s.codec_type === "video") || {};
+  const width = Number(videoStream.width);
+  const height = Number(videoStream.height);
+  const fps =
+    parseRateToFps(videoStream.avg_frame_rate) ||
+    parseRateToFps(videoStream.r_frame_rate) ||
+    0;
+  const durationFormat = Number(parsed?.format?.duration);
+  const durationStream = Number(videoStream.duration);
+  const durationSec =
+    (Number.isFinite(durationFormat) && durationFormat > 0
+      ? durationFormat
+      : Number.isFinite(durationStream) && durationStream > 0
+        ? durationStream
+        : 0);
+  if (!(width > 0 && height > 0)) {
+    throw new Error("ffprobe failed to resolve video width/height");
+  }
+  return { width, height, fps, durationSec };
+}
+
+function parseJpegDimensions(buffer) {
+  if (!Buffer.isBuffer(buffer) || buffer.length < 4) return null;
+  if (buffer[0] !== 0xff || buffer[1] !== 0xd8) return null;
+  let i = 2;
+  while (i + 9 < buffer.length) {
+    if (buffer[i] !== 0xff) {
+      i += 1;
+      continue;
+    }
+    const marker = buffer[i + 1];
+    if (marker === 0xd9 || marker === 0xda) break;
+    const length = buffer.readUInt16BE(i + 2);
+    const isSof =
+      marker >= 0xc0 &&
+      marker <= 0xcf &&
+      marker !== 0xc4 &&
+      marker !== 0xc8 &&
+      marker !== 0xcc;
+    if (isSof) {
+      if (i + 8 >= buffer.length) break;
+      const height = buffer.readUInt16BE(i + 5);
+      const width = buffer.readUInt16BE(i + 7);
+      if (width > 0 && height > 0) {
+        return { width, height };
+      }
+      break;
+    }
+    if (!(length > 2)) break;
+    i += 2 + length;
+  }
+  return null;
+}
+
+function buildBboxExactWindow(rawBbox, videoMeta) {
+  const [x1Raw, y1Raw, x2Raw, y2Raw] = rawBbox;
+  if (
+    ![x1Raw, y1Raw, x2Raw, y2Raw].every(isFiniteNumber) ||
+    x2Raw <= x1Raw ||
+    y2Raw <= y1Raw
+  ) {
+    return null;
+  }
+  const x1 = clamp(Math.floor(x1Raw), 0, videoMeta.width);
+  const x2 = clamp(Math.ceil(x2Raw), 0, videoMeta.width);
+  const y1 = clamp(Math.floor(y1Raw), 0, videoMeta.height);
+  const y2 = clamp(Math.ceil(y2Raw), 0, videoMeta.height);
+  if (x2 <= x1 || y2 <= y1) return null;
+
+  const w = x2 - x1;
+  const h = y2 - y1;
+  const newX1 = clamp(
+    Math.floor(x1 - BBOX_EXPAND_X_PER_SIDE_RATIO * w),
+    0,
+    videoMeta.width,
+  );
+  const newX2 = clamp(
+    Math.ceil(x2 + BBOX_EXPAND_X_PER_SIDE_RATIO * w),
+    0,
+    videoMeta.width,
+  );
+  const newY1 = clamp(
+    Math.floor(y1 - BBOX_EXPAND_TOP_RATIO * h),
+    0,
+    videoMeta.height,
+  );
+  const newY2 = clamp(
+    Math.ceil(y2 + BBOX_EXPAND_BOTTOM_RATIO * h),
+    0,
+    videoMeta.height,
+  );
+  if (newX2 <= newX1 || newY2 <= newY1) return null;
+
+  const expandedW = newX2 - newX1;
+  const expandedH = newY2 - newY1;
+  const jerseyX1 = clamp(
+    newX1 + Math.floor(expandedW * BBOX_JERSEY_LEFT_RATIO),
+    0,
+    videoMeta.width,
+  );
+  const jerseyX2 = clamp(
+    newX1 + Math.floor(expandedW * BBOX_JERSEY_RIGHT_RATIO),
+    0,
+    videoMeta.width,
+  );
+  const jerseyY1 = newY1;
+  const jerseyY2 = clamp(
+    newY1 + Math.floor(expandedH * BBOX_JERSEY_TOP_HEIGHT_RATIO),
+    0,
+    videoMeta.height,
+  );
+  if (jerseyX2 <= jerseyX1 || jerseyY2 <= jerseyY1) return null;
+  return {
+    x1: jerseyX1,
+    y1: jerseyY1,
+    x2: jerseyX2,
+    y2: jerseyY2,
+    method: "bbox_exact",
+  };
+}
+
+function buildCenterHeuristicWindow(centerX, centerY, videoMeta) {
+  if (!isFiniteNumber(centerX) || !isFiniteNumber(centerY)) return null;
+  const cxPx = centerX * videoMeta.width;
+  const cyPx = (centerY - CENTER_CROP_UPWARD_BIAS_RATIO) * videoMeta.height;
+  const cropW = clamp(
+    Math.floor(CENTER_CROP_WIDTH_RATIO * videoMeta.width),
+    CENTER_CROP_MIN_WIDTH_PX,
+    CENTER_CROP_MAX_WIDTH_PX,
+  );
+  const cropH = clamp(
+    Math.floor(CENTER_CROP_HEIGHT_RATIO * videoMeta.height),
+    CENTER_CROP_MIN_HEIGHT_PX,
+    CENTER_CROP_MAX_HEIGHT_PX,
+  );
+  const x1 = clamp(Math.floor(cxPx - cropW / 2), 0, videoMeta.width);
+  const x2 = clamp(Math.floor(cxPx + cropW / 2), 0, videoMeta.width);
+  const y1 = clamp(Math.floor(cyPx - cropH / 2), 0, videoMeta.height);
+  const y2 = clamp(Math.floor(cyPx + cropH / 2), 0, videoMeta.height);
+  if (x2 <= x1 || y2 <= y1) return null;
+
+  const jw = x2 - x1;
+  const jh = y2 - y1;
+  const jerseyX1 = clamp(
+    x1 + Math.floor(jw * CENTER_JERSEY_LEFT_RATIO),
+    0,
+    videoMeta.width,
+  );
+  const jerseyX2 = clamp(
+    x1 + Math.floor(jw * CENTER_JERSEY_RIGHT_RATIO),
+    0,
+    videoMeta.width,
+  );
+  const jerseyY1 = y1;
+  const jerseyY2 = clamp(
+    y1 + Math.floor(jh * CENTER_JERSEY_TOP_HEIGHT_RATIO),
+    0,
+    videoMeta.height,
+  );
+  if (jerseyX2 <= jerseyX1 || jerseyY2 <= jerseyY1) return null;
+  return {
+    x1: jerseyX1,
+    y1: jerseyY1,
+    x2: jerseyX2,
+    y2: jerseyY2,
+    method: "center_heuristic",
+  };
+}
+
+function hasValidBbox(rawBbox) {
+  return (
+    Array.isArray(rawBbox) &&
+    rawBbox.length === 4 &&
+    rawBbox.every((v) => typeof v === "number" && Number.isFinite(v))
+  );
+}
+
+async function runFfmpegCropToBuffer(params) {
+  const { inputPath, timestamp, window } = params;
+  const cropW = window.x2 - window.x1;
+  const cropH = window.y2 - window.y1;
+  if (!(cropW > 0 && cropH > 0)) {
+    throw new Error("Invalid crop dimensions");
+  }
+  const vf = `crop=${cropW}:${cropH}:${window.x1}:${window.y1}`;
+  const qScale = ffmpegQScaleFromJpegQuality(GAME_CROPS_JPEG_QUALITY);
+  const args = [
+    "-hide_banner",
+    "-loglevel",
+    "error",
+    "-ss",
+    String(Math.max(0, Number(timestamp) || 0)),
+  ];
+  if (isWebm(inputPath)) {
+    args.push("-fflags", "+genpts");
+  }
+  args.push(
+    "-i",
+    inputPath,
+    "-an",
+    "-vf",
+    vf,
+    "-frames:v",
+    "1",
+    "-q:v",
+    qScale,
+    "-f",
+    "image2pipe",
+    "-vcodec",
+    "mjpeg",
+    "pipe:1",
+  );
+
+  const startedAt = Date.now();
+  const outChunks = [];
+  const errChunks = [];
+  await new Promise((resolve, reject) => {
+    const proc = spawn(FFMPEG_PATH, args, {
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    proc.stdout.on("data", (chunk) => outChunks.push(chunk));
+    proc.stderr.on("data", (chunk) => errChunks.push(chunk));
+    proc.on("error", reject);
+    proc.on("close", (code) => {
+      if (code === 0) return resolve();
+      const errText = Buffer.concat(errChunks).toString("utf8").trim();
+      reject(new Error(`ffmpeg exited ${code}: ${errText.slice(0, 500)}`));
+    });
+  });
+  const elapsedMs = Date.now() - startedAt;
+  return { buffer: Buffer.concat(outChunks), elapsedMs };
+}
+
+async function streamDownloadGameVideoToTemp(storagePath, gameId, requestId) {
+  const supabase = getSupabase();
+  const { data, error } = await supabase.storage
+    .from("game-videos")
+    .createSignedUrl(storagePath, GAME_CROPS_SIGNED_URL_TTL_SEC);
+  if (error || !data?.signedUrl) {
+    throw new Error(error?.message || "Failed to create signed URL for game video");
+  }
+
+  const ext = path.extname(storagePath) || ".mp4";
+  const tmpName = `${sanitizeTmpId(gameId)}-${sanitizeTmpId(requestId)}${ext}`;
+  const inputPath = path.join(os.tmpdir(), tmpName);
+  const response = await fetch(data.signedUrl);
+  if (!response.ok || !response.body) {
+    throw new Error(
+      `Failed to download game video (HTTP ${response.status})`,
+    );
+  }
+  await pipeline(
+    Readable.fromWeb(response.body),
+    fs.createWriteStream(inputPath, { flags: "w" }),
+  );
+  return inputPath;
 }
 
 async function getDurationSeconds(inputPath) {
@@ -848,6 +1179,203 @@ app.post("/extract-game-film-frames", async (req, res) => {
   } finally {
     if (inputPath && fs.existsSync(inputPath)) {
       try { fs.unlinkSync(inputPath); } catch { /* */ }
+    }
+  }
+});
+
+app.post("/extract-game-film-crops", async (req, res) => {
+  const auth = req.headers.authorization || "";
+  const secret = process.env.FRAMES_SERVICE_SECRET;
+  if (!secret || auth !== `Bearer ${secret}`) {
+    return res.status(401).json({ error: "Unauthorized" });
+  }
+
+  const startedAt = Date.now();
+  const { gameId, storagePath, crops } = req.body || {};
+  if (typeof gameId !== "string" || !gameId.trim()) {
+    return res.status(400).json({ error: "gameId required" });
+  }
+  if (typeof storagePath !== "string" || !storagePath.trim()) {
+    return res.status(400).json({ error: "storagePath required" });
+  }
+  if (!Array.isArray(crops)) {
+    return res.status(400).json({ error: "crops array required" });
+  }
+  if (crops.length > GAME_CROPS_MAX_REQUEST) {
+    return res.status(400).json({
+      error: `crops cannot exceed ${GAME_CROPS_MAX_REQUEST}`,
+    });
+  }
+
+  const requestId = randomUUID();
+  console.log("[extract-game-film-crops] request start", {
+    gameId: gameId.trim(),
+    storagePath: storagePath.trim(),
+    cropsRequested: crops.length,
+    requestId,
+  });
+
+  let inputPath = null;
+  try {
+    const downloadStart = Date.now();
+    inputPath = await streamDownloadGameVideoToTemp(
+      storagePath.trim(),
+      gameId.trim(),
+      requestId,
+    );
+    const downloadMs = Date.now() - downloadStart;
+
+    const probeStart = Date.now();
+    const meta = await getVideoMetadata(inputPath);
+    const probeMs = Date.now() - probeStart;
+    console.log("[extract-game-film-crops] video metadata", {
+      requestId,
+      width: meta.width,
+      height: meta.height,
+      fps: Number(meta.fps.toFixed(3)),
+      duration_sec: Number(meta.durationSec.toFixed(3)),
+      download_ms: downloadMs,
+      probe_ms: probeMs,
+    });
+
+    let skipped = 0;
+    const out = [];
+    for (let idx = 0; idx < crops.length; idx++) {
+      const item = crops[idx];
+      if (!item || typeof item !== "object") {
+        skipped += 1;
+        console.warn("[extract-game-film-crops] skipped non-object crop", {
+          requestId,
+          index: idx,
+        });
+        continue;
+      }
+      const trackIdRaw = item.track_id;
+      const trackId = Number.isFinite(Number(trackIdRaw))
+        ? Math.trunc(Number(trackIdRaw))
+        : null;
+      const timestamp = Number(item.timestamp);
+      if (!(trackId !== null && Number.isFinite(timestamp) && timestamp >= 0)) {
+        skipped += 1;
+        console.warn("[extract-game-film-crops] skipped invalid track/timestamp", {
+          requestId,
+          index: idx,
+          track_id: trackIdRaw,
+          timestamp: item.timestamp,
+        });
+        continue;
+      }
+
+      const warnings = [];
+      const bbox = item.bbox;
+      const centerX = item.center_x;
+      const centerY = item.center_y;
+
+      let window = null;
+      if (bbox !== null && hasValidBbox(bbox)) {
+        window = buildBboxExactWindow(bbox, meta);
+      } else if (centerX !== null && centerY !== null) {
+        window = buildCenterHeuristicWindow(Number(centerX), Number(centerY), meta);
+      }
+
+      if (!window) {
+        skipped += 1;
+        console.warn("[extract-game-film-crops] skipped unresolved crop window", {
+          requestId,
+          index: idx,
+          track_id: trackId,
+        });
+        continue;
+      }
+
+      let imageBase64 = "";
+      let cropWidth = Math.max(0, window.x2 - window.x1);
+      let cropHeight = Math.max(0, window.y2 - window.y1);
+      let ffmpegMs = 0;
+
+      try {
+        const cropResult = await runFfmpegCropToBuffer({
+          inputPath,
+          timestamp,
+          window,
+        });
+        ffmpegMs = cropResult.elapsedMs;
+        imageBase64 = cropResult.buffer.toString("base64");
+        const jpegSize = parseJpegDimensions(cropResult.buffer);
+        if (jpegSize) {
+          cropWidth = jpegSize.width;
+          cropHeight = jpegSize.height;
+        }
+        if (cropWidth < GAME_CROPS_MIN_EDGE_PX || cropHeight < GAME_CROPS_MIN_EDGE_PX) {
+          warnings.push(
+            `small_output_${cropWidth}x${cropHeight}_below_${GAME_CROPS_MIN_EDGE_PX}px`,
+          );
+        }
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        warnings.push(`ffmpeg_error: ${msg}`);
+        console.error("[extract-game-film-crops] ffmpeg crop failed", {
+          requestId,
+          index: idx,
+          track_id: trackId,
+          method: window.method,
+          error: msg,
+        });
+      }
+
+      console.log("[extract-game-film-crops] crop", {
+        requestId,
+        index: idx,
+        track_id: trackId,
+        timestamp,
+        method: window.method,
+        crop_width: cropWidth,
+        crop_height: cropHeight,
+        ffmpeg_ms: ffmpegMs,
+      });
+
+      out.push({
+        track_id: trackId,
+        timestamp,
+        method: window.method,
+        image_base64: imageBase64,
+        crop_width: cropWidth,
+        crop_height: cropHeight,
+        warnings,
+      });
+    }
+
+    const elapsedMs = Date.now() - startedAt;
+    console.log("[extract-game-film-crops] request complete", {
+      requestId,
+      crops_processed: out.length,
+      crops_skipped: skipped,
+      elapsed_ms: elapsedMs,
+    });
+
+    return res.json({
+      crops_processed: out.length,
+      crops_skipped: skipped,
+      video_metadata: {
+        width: meta.width,
+        height: meta.height,
+        fps: Number(meta.fps.toFixed(3)),
+        duration_sec: Number(meta.durationSec.toFixed(3)),
+      },
+      crops: out,
+    });
+  } catch (err) {
+    console.error("[extract-game-film-crops]", err);
+    return res.status(500).json({
+      error: err instanceof Error ? err.message : "Game crop extraction failed",
+    });
+  } finally {
+    if (inputPath && fs.existsSync(inputPath)) {
+      try {
+        fs.unlinkSync(inputPath);
+      } catch {
+        /* */
+      }
     }
   }
 });

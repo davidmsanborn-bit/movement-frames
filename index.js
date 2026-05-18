@@ -54,6 +54,143 @@ const CENTER_JERSEY_LEFT_RATIO = 0.14;
 const CENTER_JERSEY_RIGHT_RATIO = 0.86;
 const CENTER_JERSEY_TOP_HEIGHT_RATIO = 0.58;
 
+function parseEnvPositiveInt(raw, fallback, min, max) {
+  const n = Number(raw);
+  if (!Number.isFinite(n)) return fallback;
+  const t = Math.trunc(n);
+  if (t < min || t > max) return fallback;
+  return t;
+}
+
+/**
+ * In-process gate for heavy CV routes (shared Railway replica, memory-capped).
+ *
+ * FRAMES_MAX_CONCURRENCY default 1: one ~99-crop game-film job (~60–120s wall
+ * with download + ffmpeg) can OOM the replica; overlapping runs stack disk +
+ * ffmpeg + response buffers.
+ *
+ * FRAMES_QUEUE_WAIT_MS default 120000 (2 min): game-film callers use
+ * AbortSignal.timeout(240_000). One job ahead (~90–120s) + 120s queue wait +
+ * own run stays under 240s; longer backlog fails fast with 503 retryable.
+ */
+const FRAMES_MAX_CONCURRENCY = parseEnvPositiveInt(
+  process.env.FRAMES_MAX_CONCURRENCY,
+  1,
+  1,
+  8,
+);
+const FRAMES_QUEUE_WAIT_MS = parseEnvPositiveInt(
+  process.env.FRAMES_QUEUE_WAIT_MS,
+  120_000,
+  1_000,
+  600_000,
+);
+
+function createHeavyGate(maxConcurrency, maxQueueWaitMs) {
+  let inFlight = 0;
+  const queue = [];
+
+  function logConcurrency(event, extra) {
+    console.log(
+      JSON.stringify({
+        type: "frames_concurrency",
+        event,
+        in_flight: inFlight,
+        queued: queue.length,
+        max_concurrency: maxConcurrency,
+        max_queue_wait_ms: maxQueueWaitMs,
+        ...extra,
+      }),
+    );
+  }
+
+  async function acquire(meta) {
+    const t0 = Date.now();
+    if (inFlight < maxConcurrency) {
+      inFlight += 1;
+      logConcurrency("acquire_immediate", { ...meta, wait_ms: 0 });
+      return 0;
+    }
+
+    logConcurrency("enqueue", meta);
+
+    await new Promise((resolve, reject) => {
+      const entry = {
+        resolve,
+        reject,
+        meta,
+        enqueuedAt: Date.now(),
+        timer: null,
+      };
+      entry.timer = setTimeout(() => {
+        const idx = queue.indexOf(entry);
+        if (idx < 0) return;
+        queue.splice(idx, 1);
+        logConcurrency("reject_queue_timeout", {
+          ...meta,
+          wait_ms: Date.now() - entry.enqueuedAt,
+        });
+        const err = new Error("Heavy frame queue wait exceeded");
+        err.code = "FRAMES_QUEUE_TIMEOUT";
+        reject(err);
+      }, maxQueueWaitMs);
+      queue.push(entry);
+    });
+
+    const waitMs = Date.now() - t0;
+    logConcurrency("dequeue", { ...meta, wait_ms: waitMs });
+    return waitMs;
+  }
+
+  function release(meta) {
+    inFlight = Math.max(0, inFlight - 1);
+    logConcurrency("release", meta);
+    while (queue.length > 0 && inFlight < maxConcurrency) {
+      const next = queue.shift();
+      clearTimeout(next.timer);
+      inFlight += 1;
+      logConcurrency("dequeue_grant", {
+        ...next.meta,
+        wait_ms: Date.now() - next.enqueuedAt,
+      });
+      next.resolve();
+    }
+  }
+
+  return { acquire, release };
+}
+
+const heavyGate = createHeavyGate(FRAMES_MAX_CONCURRENCY, FRAMES_QUEUE_WAIT_MS);
+
+function wrapHeavyHandler(handler) {
+  return async (req, res) => {
+    const meta = {
+      path: req.path,
+      request_id:
+        (typeof req.headers["x-request-id"] === "string" &&
+          req.headers["x-request-id"].trim()) ||
+        randomUUID(),
+    };
+    try {
+      await heavyGate.acquire(meta);
+    } catch (err) {
+      if (err && err.code === "FRAMES_QUEUE_TIMEOUT") {
+        return res.status(503).json({
+          error:
+            "Frame service is busy processing other videos. Please retry shortly.",
+          retryable: true,
+        });
+      }
+      throw err;
+    }
+    try {
+      await handler(req, res);
+    } finally {
+      heavyGate.release(meta);
+    }
+  };
+}
+
 function isWebm(filePath) {
   return path.extname(filePath).toLowerCase() === ".webm";
 }
@@ -1006,7 +1143,7 @@ app.get("/health", (_req, res) => {
   res.json({ ok: true });
 });
 
-app.post("/extract-frames", async (req, res) => {
+app.post("/extract-frames", wrapHeavyHandler(async (req, res) => {
   const auth = req.headers.authorization || "";
   const secret = process.env.SERVICE_SECRET;
   if (!secret || auth !== `Bearer ${secret}`) {
@@ -1046,7 +1183,7 @@ app.post("/extract-frames", async (req, res) => {
       }
     }
   }
-});
+}));
 // ─── Game Film Frame Extraction ────────────────────────────────────────────
 
 async function downloadGameVideoToTemp(storagePath, gameId) {
@@ -1149,7 +1286,7 @@ async function extractGameFilmFrames(inputPath, gameId) {
   }
 }
 
-app.post("/extract-game-film-frames", async (req, res) => {
+app.post("/extract-game-film-frames", wrapHeavyHandler(async (req, res) => {
   const auth = req.headers.authorization || "";
   const secret = process.env.FRAMES_SERVICE_SECRET;
   if (!secret || auth !== `Bearer ${secret}`) {
@@ -1181,9 +1318,9 @@ app.post("/extract-game-film-frames", async (req, res) => {
       try { fs.unlinkSync(inputPath); } catch { /* */ }
     }
   }
-});
+}));
 
-app.post("/extract-game-film-crops", async (req, res) => {
+app.post("/extract-game-film-crops", wrapHeavyHandler(async (req, res) => {
   const auth = req.headers.authorization || "";
   const secret = process.env.FRAMES_SERVICE_SECRET;
   if (!secret || auth !== `Bearer ${secret}`) {
@@ -1378,7 +1515,7 @@ app.post("/extract-game-film-crops", async (req, res) => {
       }
     }
   }
-});
+}));
 
 async function detectMotionIntensity(inputPath, startSec, endSec) {
   // Use ffmpeg signalstats filter to measure pixel-level activity.
@@ -1708,7 +1845,7 @@ async function detectSceneWindows(inputPath, gameId) {
   }
 }
 
-app.post("/detect-scenes", async (req, res) => {
+app.post("/detect-scenes", wrapHeavyHandler(async (req, res) => {
   const auth = req.headers.authorization || "";
   const secret = process.env.FRAMES_SERVICE_SECRET;
   if (!secret || auth !== `Bearer ${secret}`) {
@@ -1764,7 +1901,7 @@ app.post("/detect-scenes", async (req, res) => {
       try { fs.unlinkSync(inputPath); } catch { /* */ }
     }
   }
-});
+}));
 
 app.listen(PORT, () => {
   console.log(`[frames] listening on ${PORT}`);

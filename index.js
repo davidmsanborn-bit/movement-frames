@@ -13,6 +13,11 @@ const { randomUUID } = require("crypto");
 const { execFile, spawn } = require("child_process");
 const { promisify } = require("util");
 const { createClient } = require("@supabase/supabase-js");
+const {
+  parseContinuousEnv,
+  evaluateContinuousTrigger,
+  runContinuousMotionPath,
+} = require("./lib/continuousMotion");
 
 const execFileAsync = promisify(execFile);
 
@@ -1771,6 +1776,21 @@ async function detectSceneWindows(inputPath, gameId) {
     }
 
     console.log(`[detect-scenes] produced ${scenes.length} play windows for ${gameId}`);
+
+    const continuousEnv = parseContinuousEnv();
+    const trigger = evaluateContinuousTrigger(scenes, duration, continuousEnv);
+    if (trigger.shouldTrigger) {
+      console.log(
+        `[detect-scenes] continuous motion path for ${gameId}: ${trigger.triggerReason} ` +
+          `(scene_cut_windows=${trigger.sceneCutWindowCount} coverage=${trigger.sceneCutCoveragePct}%)`,
+      );
+      return runContinuousMotionPath(FFMPEG_PATH, workingPath, gameId, duration, {
+        sceneCutWindowCount: trigger.sceneCutWindowCount,
+        sceneCutCoveragePct: trigger.sceneCutCoveragePct,
+        triggerReason: trigger.triggerReason,
+      });
+    }
+
     if (scenes.length === 0) {
       console.log(`[detect-scenes] no scene changes — falling back to uniform 10s windows for ${gameId}`);
       const WINDOW_SEC = 10;
@@ -1871,14 +1891,31 @@ app.post("/detect-scenes", wrapHeavyHandler(async (req, res) => {
       (sum, s) => sum + (s.scene_change_count || 0),
       0,
     );
-    const fallbackUsed = scenes.some((s) => s.source === "uniform_fallback");
-    const sceneDetected = scenes.some((s) => s.source !== "uniform_fallback");
-    const detectionMethod =
-      fallbackUsed && sceneDetected
-        ? "mixed"
-        : fallbackUsed
-          ? "uniform_fallback"
-          : "scene_detection";
+    const hasContinuousMotion = scenes.some(
+      (s) => s.source === "continuous_motion",
+    );
+    const hasContinuousStatic = scenes.some(
+      (s) => s.source === "continuous_static_fallback",
+    );
+    const fallbackUsed = scenes.some(
+      (s) =>
+        s.source === "uniform_fallback" ||
+        s.source === "continuous_static_fallback",
+    );
+    const sceneDetected = scenes.some(
+      (s) =>
+        s.source !== "uniform_fallback" &&
+        s.source !== "continuous_static_fallback",
+    );
+    const detectionMethod = hasContinuousMotion
+      ? "continuous_motion"
+      : hasContinuousStatic
+        ? "continuous_static_fallback"
+        : fallbackUsed && sceneDetected
+          ? "mixed"
+          : fallbackUsed
+            ? "uniform_fallback"
+            : "scene_detection";
 
     // Get duration from last scene end (timeline coverage for sampling)
     const lastScene = scenes[scenes.length - 1];

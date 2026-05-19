@@ -1882,7 +1882,24 @@ app.post("/detect-scenes", wrapHeavyHandler(async (req, res) => {
   let inputPath = null;
   try {
     console.log(`[detect-scenes] starting for game ${gameId}`);
-    inputPath = await downloadGameVideoToTemp(storagePath.trim(), gameId.trim());
+    const downloadStart = Date.now();
+    const downloadRequestId = randomUUID();
+    inputPath = await streamDownloadGameVideoToTemp(
+      storagePath.trim(),
+      gameId.trim(),
+      downloadRequestId,
+    );
+    const downloadMs = Date.now() - downloadStart;
+    const downloadBytes = fs.statSync(inputPath).size;
+    console.log(
+      JSON.stringify({
+        type: "detect_scenes_download",
+        game_id: gameId.trim(),
+        bytes: downloadBytes,
+        download_ms: downloadMs,
+        method: "stream",
+      }),
+    );
     const scenes = await detectSceneWindows(inputPath, gameId.trim());
     console.log(`[detect-scenes] complete: ${scenes.length} windows for ${gameId}`);
 

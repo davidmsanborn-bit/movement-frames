@@ -1,5 +1,6 @@
 FROM node:20-slim
-RUN apt-get update && apt-get install -y ffmpeg && rm -rf /var/lib/apt/lists/*
+COPY --from=mwader/static-ffmpeg:7.1 /ffmpeg /usr/bin/ffmpeg
+COPY --from=mwader/static-ffmpeg:7.1 /ffprobe /usr/bin/ffprobe
 WORKDIR /app
 COPY package*.json ./
 RUN npm install

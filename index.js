@@ -534,7 +534,7 @@ async function getDurationSeconds(inputPath) {
 async function normalizeVideo(inputPath, analysisId) {
   const normalizedPath = path.join(
     os.tmpdir(),
-    `normalized_${analysisId}.mp4`,
+    `normalized_${analysisId}_${process.pid}_${Date.now()}.mp4`,
   );
 
   try {

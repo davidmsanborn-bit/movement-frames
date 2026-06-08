@@ -1784,11 +1784,12 @@ async function detectSceneWindows(inputPath, gameId) {
         `[detect-scenes] continuous motion path for ${gameId}: ${trigger.triggerReason} ` +
           `(scene_cut_windows=${trigger.sceneCutWindowCount} coverage=${trigger.sceneCutCoveragePct}%)`,
       );
-      return runContinuousMotionPath(FFMPEG_PATH, workingPath, gameId, duration, {
+      const continuousScenes = await runContinuousMotionPath(FFMPEG_PATH, workingPath, gameId, duration, {
         sceneCutWindowCount: trigger.sceneCutWindowCount,
         sceneCutCoveragePct: trigger.sceneCutCoveragePct,
         triggerReason: trigger.triggerReason,
       });
+      return continuousScenes;
     }
 
     if (scenes.length === 0) {

@@ -9,7 +9,7 @@ const os = require("os");
 const path = require("path");
 const { Readable } = require("stream");
 const { pipeline } = require("stream/promises");
-const { randomUUID } = require("crypto");
+const { randomUUID, createHash } = require("crypto");
 const { execFile, spawn } = require("child_process");
 const { promisify } = require("util");
 const { createClient } = require("@supabase/supabase-js");
@@ -40,6 +40,8 @@ const UNIFORM_SEGMENT_COUNT = 10;
 const LOW_VARIANCE_MAX_CV = 0.035;
 const GAME_CROPS_MAX_REQUEST = 100;
 const GAME_CROPS_SIGNED_URL_TTL_SEC = 60 * 60;
+const GAME_VIDEO_CACHE_PREFIX = "motiq_game_cache_";
+const GAME_VIDEO_CACHE_MAX_AGE_MS = 2 * 60 * 60 * 1000;
 const GAME_CROPS_MIN_EDGE_PX = 32;
 const GAME_CROPS_JPEG_QUALITY = 85;
 const CENTER_CROP_WIDTH_RATIO = 0.08;
@@ -493,6 +495,7 @@ async function runFfmpegCropToBuffer(params) {
 }
 
 async function streamDownloadGameVideoToTemp(storagePath, gameId, requestId) {
+  pruneCachedGameVideoFiles();
   const supabase = getSupabase();
   const { data, error } = await supabase.storage
     .from("game-videos")
@@ -502,19 +505,107 @@ async function streamDownloadGameVideoToTemp(storagePath, gameId, requestId) {
   }
 
   const ext = path.extname(storagePath) || ".mp4";
-  const tmpName = `${sanitizeTmpId(gameId)}-${sanitizeTmpId(requestId)}${ext}`;
-  const inputPath = path.join(os.tmpdir(), tmpName);
+  const cacheKey = createHash("sha256")
+    .update(storagePath)
+    .digest("hex")
+    .slice(0, 24);
+  const cacheName = `${GAME_VIDEO_CACHE_PREFIX}${sanitizeTmpId(gameId)}-${cacheKey}${ext}`;
+  const inputPath = path.join(os.tmpdir(), cacheName);
+  const partialPath = `${inputPath}.${sanitizeTmpId(requestId)}.partial`;
+
+  let expectedBytes = null;
+  try {
+    const headRes = await fetch(data.signedUrl, { method: "HEAD" });
+    if (headRes.ok) {
+      const contentLengthRaw = headRes.headers.get("content-length");
+      const contentLength = Number(contentLengthRaw);
+      if (Number.isFinite(contentLength) && contentLength > 0) {
+        expectedBytes = Math.trunc(contentLength);
+      }
+    }
+  } catch {
+    // Best-effort optimization only; fallback to download path.
+  }
+
+  if (expectedBytes !== null && fs.existsSync(inputPath)) {
+    try {
+      const stat = fs.statSync(inputPath);
+      if (stat.size === expectedBytes) {
+        console.log("[extract-game-film-crops] cache hit", {
+          storagePath,
+          cachePath: inputPath,
+          expectedBytes,
+        });
+        return {
+          inputPath,
+          cacheHit: true,
+          downloadMs: 0,
+        };
+      }
+    } catch {
+      // Fall through to re-download path.
+    }
+  }
+
   const response = await fetch(data.signedUrl);
   if (!response.ok || !response.body) {
     throw new Error(
       `Failed to download game video (HTTP ${response.status})`,
     );
   }
-  await pipeline(
-    Readable.fromWeb(response.body),
-    fs.createWriteStream(inputPath, { flags: "w" }),
-  );
-  return inputPath;
+  const downloadStartedMs = Date.now();
+  try {
+    await pipeline(
+      Readable.fromWeb(response.body),
+      fs.createWriteStream(partialPath, { flags: "w" }),
+    );
+    const downloadedBytes = fs.statSync(partialPath).size;
+    if (expectedBytes !== null && downloadedBytes !== expectedBytes) {
+      throw new Error(
+        `Downloaded bytes mismatch (${downloadedBytes} != ${expectedBytes})`,
+      );
+    }
+    fs.renameSync(partialPath, inputPath);
+    return {
+      inputPath,
+      cacheHit: false,
+      downloadMs: Date.now() - downloadStartedMs,
+    };
+  } finally {
+    if (fs.existsSync(partialPath)) {
+      try { fs.unlinkSync(partialPath); } catch { /* */ }
+    }
+  }
+}
+
+function pruneCachedGameVideoFiles() {
+  const cutoffMs = Date.now() - GAME_VIDEO_CACHE_MAX_AGE_MS;
+  let removed = 0;
+  let scanned = 0;
+  const tmpDir = os.tmpdir();
+  let entries = [];
+  try {
+    entries = fs.readdirSync(tmpDir);
+  } catch {
+    return;
+  }
+  for (const entry of entries) {
+    if (!entry.startsWith(GAME_VIDEO_CACHE_PREFIX)) continue;
+    scanned += 1;
+    const fullPath = path.join(tmpDir, entry);
+    try {
+      const stat = fs.statSync(fullPath);
+      if (stat.mtimeMs < cutoffMs) {
+        fs.unlinkSync(fullPath);
+        removed += 1;
+      }
+    } catch {
+      // Ignore races and filesystem noise.
+    }
+  }
+  if (removed > 0) {
+    console.log("[frames-cache] pruned stale game videos", { scanned, removed });
+  }
 }
 
 async function getDurationSeconds(inputPath) {
@@ -1359,13 +1450,13 @@ app.post("/extract-game-film-crops", wrapHeavyHandler(async (req, res) => {
 
   let inputPath = null;
   try {
-    const downloadStart = Date.now();
-    inputPath = await streamDownloadGameVideoToTemp(
+    const downloadResult = await streamDownloadGameVideoToTemp(
       storagePath.trim(),
       gameId.trim(),
       requestId,
     );
-    const downloadMs = Date.now() - downloadStart;
+    inputPath = downloadResult.inputPath;
+    const downloadMs = downloadResult.downloadMs;
 
     const probeStart = Date.now();
     const meta = await getVideoMetadata(inputPath);
@@ -1377,6 +1468,7 @@ app.post("/extract-game-film-crops", wrapHeavyHandler(async (req, res) => {
       fps: Number(meta.fps.toFixed(3)),
       duration_sec: Number(meta.durationSec.toFixed(3)),
       download_ms: downloadMs,
+      cache_hit: downloadResult.cacheHit,
       probe_ms: probeMs,
     });
 
@@ -1488,6 +1580,16 @@ app.post("/extract-game-film-crops", wrapHeavyHandler(async (req, res) => {
     }
 
     const elapsedMs = Date.now() - startedAt;
+    const perCropMeanMs = crops.length > 0
+      ? Number((elapsedMs / crops.length).toFixed(2))
+      : 0;
+    console.log(
+      `[extract-game-film-crops] perf ${
+        downloadResult.cacheHit
+          ? "cache_hit=true"
+          : `download_ms=${downloadMs}`
+      } crops_requested=${crops.length} extract_ms_total=${elapsedMs} per_crop_mean_ms=${perCropMeanMs}`,
+    );
     console.log("[extract-game-film-crops] request complete", {
       requestId,
       crops_processed: out.length,
@@ -1511,14 +1613,6 @@ app.post("/extract-game-film-crops", wrapHeavyHandler(async (req, res) => {
     return res.status(500).json({
       error: err instanceof Error ? err.message : "Game crop extraction failed",
     });
-  } finally {
-    if (inputPath && fs.existsSync(inputPath)) {
-      try {
-        fs.unlinkSync(inputPath);
-      } catch {
-        /* */
-      }
-    }
   }
 }));
 
@@ -1883,14 +1977,14 @@ app.post("/detect-scenes", wrapHeavyHandler(async (req, res) => {
   let inputPath = null;
   try {
     console.log(`[detect-scenes] starting for game ${gameId}`);
-    const downloadStart = Date.now();
     const downloadRequestId = randomUUID();
-    inputPath = await streamDownloadGameVideoToTemp(
+    const downloadResult = await streamDownloadGameVideoToTemp(
       storagePath.trim(),
       gameId.trim(),
       downloadRequestId,
     );
-    const downloadMs = Date.now() - downloadStart;
+    inputPath = downloadResult.inputPath;
+    const downloadMs = downloadResult.downloadMs;
     const downloadBytes = fs.statSync(inputPath).size;
     console.log(
       JSON.stringify({
@@ -1898,6 +1992,7 @@ app.post("/detect-scenes", wrapHeavyHandler(async (req, res) => {
         game_id: gameId.trim(),
         bytes: downloadBytes,
         download_ms: downloadMs,
+        cache_hit: downloadResult.cacheHit,
         method: "stream",
       }),
     );
@@ -1951,10 +2046,6 @@ app.post("/detect-scenes", wrapHeavyHandler(async (req, res) => {
     return res.status(500).json({
       error: err instanceof Error ? err.message : "Scene detection failed",
     });
-  } finally {
-    if (inputPath && fs.existsSync(inputPath)) {
-      try { fs.unlinkSync(inputPath); } catch { /* */ }
-    }
   }
 }));
 
